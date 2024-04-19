@@ -8,10 +8,11 @@ Loader that uses H2O DocTR OCR models to extract text from images
 from typing import List, Union, Any, Tuple, Optional
 
 import requests
+import torch
 from langchain.docstore.document import Document
-from langchain.document_loaders import ImageCaptionLoader
+from langchain_community.document_loaders import ImageCaptionLoader
 import numpy as np
-from utils import get_device, clear_torch_cache
+from utils import get_device, clear_torch_cache, NullContext
 from doctr.utils.common_types import AbstractFile
 
 
@@ -22,7 +23,7 @@ class H2OOCRLoader(ImageCaptionLoader):
         super().__init__(path_images)
         self._ocr_model = None
         self.layout_aware = layout_aware
-        self.gpu_id = gpu_id
+        self.gpu_id = gpu_id if isinstance(gpu_id, int) and gpu_id >= 0 else 0
 
         self.device = 'cpu'
         # ensure self.device set
@@ -31,11 +32,11 @@ class H2OOCRLoader(ImageCaptionLoader):
     def set_context(self):
         if get_device() == 'cuda':
             import torch
-            n_gpus = torch.cuda.device_count() if torch.cuda.is_available else 0
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
             if n_gpus > 0:
                 self.context_class = torch.device
                 if self.gpu_id is not None:
-                    self.device = torch.device("cuda:%d" % self.gpu_id)
+                    self.device = "cuda:%d" % self.gpu_id
                 else:
                     self.device = 'cuda'
             else:
@@ -61,13 +62,13 @@ class H2OOCRLoader(ImageCaptionLoader):
         return self
 
     def unload_model(self):
-        if hasattr(self._ocr_model.det_predictor.model, 'cpu'):
+        if self._ocr_model and hasattr(self._ocr_model.det_predictor.model, 'cpu'):
             self._ocr_model.det_predictor.model.cpu()
             clear_torch_cache()
-        if hasattr(self._ocr_model.reco_predictor.model, 'cpu'):
+        if self._ocr_model and hasattr(self._ocr_model.reco_predictor.model, 'cpu'):
             self._ocr_model.reco_predictor.model.cpu()
             clear_torch_cache()
-        if hasattr(self._ocr_model, 'cpu'):
+        if self._ocr_model and hasattr(self._ocr_model, 'cpu'):
             self._ocr_model.cpu()
             clear_torch_cache()
 
@@ -83,13 +84,15 @@ class H2OOCRLoader(ImageCaptionLoader):
     def load(self, prompt=None) -> List[Document]:
         if self._ocr_model is None:
             self.load_model()
+        context_class = torch.cuda.device(self.gpu_id) if 'cuda' in str(self.device) else NullContext
         results = []
-        for document_path in self.document_paths:
-            caption, metadata = self._get_captions_and_metadata(
-                model=self._ocr_model, document_path=document_path
-            )
-            doc = Document(page_content=" \n".join(caption), metadata=metadata)
-            results.append(doc)
+        with context_class:
+            for document_path in self.document_paths:
+                caption, metadata = self._get_captions_and_metadata(
+                    model=self._ocr_model, document_path=document_path
+                )
+                doc = Document(page_content=" \n".join(caption), metadata=metadata)
+                results.append(doc)
 
         return results
 
@@ -98,6 +101,7 @@ class H2OOCRLoader(ImageCaptionLoader):
         """
         Helper function for getting the captions and metadata of an image
         """
+        from src.image_utils import pad_resize_image
         try:
             from doctr.io import DocumentFile
         except ImportError:
@@ -114,7 +118,12 @@ class H2OOCRLoader(ImageCaptionLoader):
         except Exception:
             raise ValueError(f"Could not get image data for {document_path}")
         document_words = []
+        shapes = []
         for image in images:
+            shape0 = str(image.shape)
+            image = pad_resize_image(image)
+            shape1 = str(image.shape)
+
             ocr_output = model([image])
             page_words = []
             page_boxes = []
@@ -134,7 +143,8 @@ class H2OOCRLoader(ImageCaptionLoader):
             else:
                 page_words = " ".join(page_words)
             document_words.append(page_words)
-        metadata: dict = {"image_path": document_path}
+            shapes.append(dict(shape0=shape0, shape1=shape1))
+        metadata: dict = {"image_path": document_path, 'shape': str(shapes)}
         return document_words, metadata
 
 
@@ -180,7 +190,7 @@ def union_box(box1, box2):
     return [x1, y1, x2, y2]
 
 
-def space_layout(texts, boxes):
+def space_layout(texts, boxes, threshold_show_spaces=8, threshold_char_width=0.02):
     line_boxes = []
     line_texts = []
     max_line_char_num = 0
@@ -206,8 +216,12 @@ def space_layout(texts, boxes):
             line_width = line_width[:, 2].max() - line_width[:, 0].min()
 
     char_width = (line_width / max_line_char_num) if max_line_char_num > 0 else 0
-    if char_width == 0:
-        char_width = 1
+    if threshold_char_width == 0.0:
+        if char_width == 0:
+            char_width = 1
+    else:
+        if char_width <= 0.02:
+            char_width = 0.02
 
     space_line_texts = []
     for i, line_box in enumerate(line_boxes):
@@ -220,7 +234,7 @@ def space_layout(texts, boxes):
             # space_line_text += " " * left_char_num
 
             # minified layout
-            if left_char_num > 1:
+            if left_char_num > threshold_show_spaces:
                 space_line_text += f" <{left_char_num}> "
             else:
                 space_line_text += " "

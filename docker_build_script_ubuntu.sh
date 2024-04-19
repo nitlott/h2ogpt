@@ -5,7 +5,8 @@ set -ex
 export DEBIAN_FRONTEND=noninteractive
 export PATH=/h2ogpt_conda/bin:$PATH
 export HOME=/workspace
-export CUDA_HOME=/usr/local/cuda-11.8
+export CUDA_HOME=/usr/local/cuda-12.1
+export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu121 https://huggingface.github.io/autogptq-index/whl/cu121"
 
 # Install linux dependencies
 apt-get update && apt-get install -y \
@@ -27,43 +28,24 @@ apt-get update && apt-get install -y \
 apt-get upgrade -y
 
 # Install conda
-wget https://repo.anaconda.com/miniconda/Miniconda3-py310_23.1.0-1-Linux-x86_64.sh && \
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
     mkdir -p /h2ogpt_conda && \
-    bash ./Miniconda3-py310_23.1.0-1-Linux-x86_64.sh -b -u -p /h2ogpt_conda && \
-    conda install python=3.10 pygobject weasyprint -c conda-forge -y
+    bash ./Miniconda3-latest-Linux-x86_64.sh -b -u -p /h2ogpt_conda && \
+    conda update -n base conda && \
+    source /h2ogpt_conda/etc/profile.d/conda.sh && \
+    conda create -n h2ogpt -y && \
+    conda activate h2ogpt && \
+    conda install python=3.10 pygobject weasyprint -c conda-forge -y && \
+    echo "h2oGPT conda env: $CONDA_DEFAULT_ENV"
 
-# Install base python dependencies
-python3.10 -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu118
-python3.10 -m pip install -r reqs_optional/requirements_optional_langchain.txt --extra-index-url https://download.pytorch.org/whl/cu118
-python3.10 -m pip install -r reqs_optional/requirements_optional_gpt4all.txt --extra-index-url https://download.pytorch.org/whl/cu118
-python3.10 -m pip install -r reqs_optional/requirements_optional_langchain.gpllike.txt --extra-index-url https://download.pytorch.org/whl/cu118
-python3.10 -m pip install -r reqs_optional/requirements_optional_langchain.urls.txt --extra-index-url https://download.pytorch.org/whl/cu118
+# if building for CPU, would remove CMAKE_ARGS and avoid GPU image as base image
+export LLAMA_CUBLAS=1
+export CMAKE_ARGS="-DLLAMA_CUBLAS=on -DCMAKE_CUDA_ARCHITECTURES=all"
+export FORCE_CMAKE=1
 
-python3.10 -m pip install -r reqs_optional/requirements_optional_doctr.txt --extra-index-url https://download.pytorch.org/whl/cu118
-# go back to older onnx so Tesseract OCR still works
-python3.10 -m pip install onnxruntime==1.15.0 onnxruntime-gpu==1.15.0 --extra-index-url https://download.pytorch.org/whl/cu118 && \
-    python3.10 -m pip uninstall -y weasyprint && \
-    python3.10 -m pip install weasyprint
+bash docs/linux_install.sh
+
 chmod -R a+rwx /h2ogpt_conda
-
-# Install prebuilt dependencies
-for i in 1 2 3 4; do python3.10 -m nltk.downloader all && break || sleep 1; done  # retry as frequently fails with github downloading issues
-python3.10 -m pip install https://github.com/PanQiWei/AutoGPTQ/releases/download/v0.4.2/auto_gptq-0.4.2+cu118-cp310-cp310-linux_x86_64.whl
-# GGMLv3 ONLY:
-python3.10 -m pip install https://github.com/jllllll/llama-cpp-python-cuBLAS-wheels/releases/download/textgen-webui/llama_cpp_python_cuda-0.1.73+cu118-cp310-cp310-linux_x86_64.whl
-# GGUF ONLY for GPU:
-# pip install https://github.com/jllllll/llama-cpp-python-cuBLAS-wheels/releases/download/textgen-webui/llama_cpp_python_cuda-0.1.83+cu117-cp310-cp310-linux_x86_64.whl
-# GGUF ONLY for CPU (AVX2):
-# pip install https://github.com/jllllll/llama-cpp-python-cuBLAS-wheels/releases/download/cpu/llama_cpp_python-0.1.83+cpuavx2-cp310-cp310-linux_x86_64.whl
-python3.10 -m pip install autoawq
-python3.10 -m pip install git+https://github.com/tomaarsen/attention_sinks.git
-python3.10 -m pip install https://github.com/jllllll/exllama/releases/download/0.0.13/exllama-0.0.13+cu118-cp310-cp310-linux_x86_64.whl --no-cache-dir
-python3.10 -m pip install flash-attn==2.3.1.post1 --no-build-isolation
-playwright install --with-deps
-
-# Uninstall duckdb and use own so can control thread count per db
-python3.10 -m pip uninstall -y pyduckdb duckdb && \
-python3.10 -m pip install https://s3.amazonaws.com/artifacts.h2o.ai/deps/h2ogpt/duckdb-0.8.2.dev4026%2Bgdcd8c1ffc5-cp310-cp310-linux_x86_64.whl --no-cache-dir --force-reinstall
 
 # setup tiktoken cache
 export TIKTOKEN_CACHE_DIR=/workspace/tiktoken_cache
@@ -100,37 +82,34 @@ for enc in model_encodings:
 print('Done!')
 "
 
-# Install vllm
-# gputil is for rayWorker in vllm to run as non-root
+############################################################
+# vllm server
 export VLLM_CACHE=/workspace/.vllm_cache
-cd /h2ogpt_conda && python -m venv vllm_env --system-site-packages
-sp=`python3.10 -c 'import site; print(site.getsitepackages()[0])'` && \
-    sed -i 's/posthog\.capture/return\n            posthog.capture/' $sp/chromadb/telemetry/posthog.py && \
-    cd $sp && \
-    sed -i  's/with HiddenPrints():/if True:/g' langchain/utilities/serpapi.py && \
-    rm -rf openvllm* && \
-    cp -a openai openvllm && \
-    file0=`ls|grep openai|grep dist-info` && \
-    file1=`echo $file0|sed 's/openai-/openvllm-/g'` && \
-    cp -a $file0 $file1 && \
-    find openvllm -name '*.py' | xargs sed -i 's/from openai /from openvllm /g' && \
-    find openvllm -name '*.py' | xargs sed -i 's/openai\./openvllm./g' && \
-    find openvllm -name '*.py' | xargs sed -i 's/from openai\./from openvllm./g' && \
-    find openvllm -name '*.py' | xargs sed -i 's/import openai/import openvllm/g' && \
-    find openvllm -name '*.py' | xargs sed -i 's/OpenAI/vLLM/g' && \
-    cd /h2ogpt_conda && \
-    python -m venv vllm_env --system-site-packages && \
-    /h2ogpt_conda/vllm_env/bin/python -m pip install vllm ray pandas gputil==1.4.0 --extra-index-url https://download.pytorch.org/whl/cu118 && \
-    mkdir $VLLM_CACHE
+conda create -n vllm -y
+source /h2ogpt_conda/etc/profile.d/conda.sh
+conda activate vllm
+conda install python=3.10 -y
+echo "vLLM conda env: $CONDA_DEFAULT_ENV"
+
+# gputil is for rayWorker in vllm to run as non-root
+# below required outside docker:
+# apt-get install libnccl2
+python -m pip install vllm==0.4.0.post1
+python -m pip install gputil==1.4.0 hf_transfer==0.1.6
+python -m pip install flash-attn==2.5.6 --no-build-isolation --no-deps --no-cache-dir
+
+# pip install hf_transfer
+# pip install tiktoken accelerate flash_attn
+mkdir $VLLM_CACHE
 chmod -R a+rwx /h2ogpt_conda
 
 # Make sure old python location works in case using scripts from old documentation
-mkdir -p /h2ogpt_conda/envs/vllm/bin && \
-    ln -s /h2ogpt_conda/vllm_env/bin/python3.10 /h2ogpt_conda/envs/vllm/bin/python3.10
+mkdir -p /h2ogpt_conda/vllm_env/bin/
+ln -s /h2ogpt_conda/envs/vllm/bin/python3.10 /h2ogpt_conda/vllm_env/bin/python3.10
 
 # Track build info
-cd /workspace && make build_info.txt
 cp /workspace/build_info.txt /build_info.txt
+cp /workspace/git_hash.txt /git_hash.txt
 
 mkdir -p /workspace/save
 chmod -R a+rwx /workspace/save
@@ -138,3 +117,23 @@ chmod -R a+rwx /workspace/save
 # Cleanup
 rm -rf /workspace/Miniconda3-py310_23.1.0-1-Linux-x86_64.sh
 rm -rf /workspace/.cache/pip
+rm -rf /h2ogpt_conda/pkgs
+rm -rf /workspace/spaces
+rm -rf /workspace/benchmarks
+rm -rf /workspace/data
+rm -rf /workspace/cloud
+rm -rf /workspace/docs
+rm -rf /workspace/helm
+rm -rf /workspace/notebooks
+rm -rf /workspace/papers
+
+# Hotswap vulnerable dependencies
+wget https://s3.amazonaws.com/artifacts.h2o.ai/deps/h2ogpt/ubuntu20.04/apparmor_4.0.0~alpha2-0ubuntu5_amd64.deb
+wget https://s3.amazonaws.com/artifacts.h2o.ai/deps/h2ogpt/ubuntu20.04/libapparmor1_4.0.0~alpha2-0ubuntu5_amd64.deb
+dpkg -i libapparmor1_4.0.0~alpha2-0ubuntu5_amd64.deb
+dpkg -i apparmor_4.0.0~alpha2-0ubuntu5_amd64.deb
+rm -rf libapparmor1_4*.deb apparmor_4*.deb
+
+wget https://s3.amazonaws.com/artifacts.h2o.ai/deps/h2ogpt/ubuntu20.04/libarchive13_3.6.2-1ubuntu1_amd64.deb
+dpkg -i libarchive13_3.6.2-1ubuntu1_amd64.deb
+rm -rf libarchive13_3.6.2-1ubuntu1_amd64.deb

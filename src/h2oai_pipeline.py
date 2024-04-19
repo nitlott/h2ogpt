@@ -1,5 +1,6 @@
 import os
 
+import torch
 from transformers import TextGenerationPipeline
 from transformers.pipelines.text_generation import ReturnType
 
@@ -17,6 +18,7 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
                  base_model=None,
                  stop=None,
                  truncation_generation=None,
+                 max_time=None,
                  verbose=False,
                  **kwargs):
         """
@@ -37,6 +39,7 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
         super().__init__(*args, **kwargs)
         self.prompt_text = None
         self.use_prompter = use_prompter
+        self.prompts = []
         self.prompt_type = prompt_type
         self.prompt_dict = prompt_dict
         self.prompter = prompter
@@ -47,8 +50,8 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
             if self.prompter is not None:
                 assert self.prompter.prompt_type is not None
             else:
-                self.prompter = Prompter(self.prompt_type, self.prompt_dict, debug=debug, chat=chat,
-                                         stream_output=stream_output)
+                self.prompter = Prompter(self.prompt_type, self.prompt_dict, debug=debug,
+                                         stream_output=stream_output, tokenizer=self.tokenizer)
             self.human = self.prompter.humanstr
             self.bot = self.prompter.botstr
             self.can_stop = True
@@ -63,6 +66,7 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
         self.base_model = base_model
         self.verbose = verbose
         self.truncation_generation = truncation_generation
+        self.max_time = max_time
 
     @staticmethod
     def get_token_count(x, tokenizer):
@@ -73,13 +77,19 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
         else:
             tokens = tokenizer(x)
         if isinstance(tokens, dict) and 'input_ids' in tokens:
-            n_tokens = len(tokenizer.encode(x)['input_ids'])
+            tokens = tokens['input_ids']
+        if isinstance(tokens, list):
+            n_tokens = len(tokens)
+        elif len(tokens.shape) == 2:
+            n_tokens = tokens.shape[1]
+        elif len(tokens.shape) == 1:
+            n_tokens = tokens.shape[0]
         else:
-            n_tokens = len(tokenizer.encode(x))
+            raise RuntimeError("Cannot handle tokens: %s" % tokens)
         return n_tokens
 
     @staticmethod
-    def limit_prompt(prompt_text, tokenizer, max_prompt_length=None):
+    def limit_prompt(prompt_text, tokenizer, max_prompt_length=None, buffer=256):
         if prompt_text is None:
             prompt_text = ''
         verbose = bool(int(os.getenv('VERBOSE_PIPELINE', '0')))
@@ -88,7 +98,7 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
             # model_max_length only defined for generate.py, not raw use of h2oai_pipeline.py
             model_max_length = int(tokenizer.model_max_length)
             if max_prompt_length is not None:
-                model_max_length = min(model_max_length, max_prompt_length)
+                model_max_length = int(min(model_max_length, max_prompt_length))
             # cut at some upper likely limit to avoid excessive tokenization etc
             # upper bound of 10 chars/token, e.g. special chars sometimes are long
             if len(prompt_text) > model_max_length * 10:
@@ -111,11 +121,11 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
                     num_prompt_tokens = H2OTextGenerationPipeline.get_token_count(prompt_text, tokenizer)
                 else:
                     num_prompt_tokens = 0
-                if num_prompt_tokens > model_max_length:
+                if num_prompt_tokens > model_max_length and num_prompt_tokens > 0:
                     # conservative by using int()
                     chars_per_token = len(prompt_text) / num_prompt_tokens
                     # keep tail, where question is if using langchain
-                    model_max_length_with_buffer = model_max_length - 256
+                    model_max_length_with_buffer = model_max_length - buffer
                     prompt_text = prompt_text[-int(model_max_length_with_buffer * chars_per_token):]
                     if verbose:
                         print("reducing %s tokens, assuming average of %s chars/token for %s characters" % (
@@ -138,6 +148,7 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
         if self.prompter is not None:
             prompt_text = self.prompter.generate_prompt(data_point)
         self.prompt_text = prompt_text
+        self.prompts.append(prompt_text)
         if handle_long_generation is None:
             # forces truncation of inputs to avoid critical failure
             handle_long_generation = None  # disable with new approaches
@@ -225,6 +236,9 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
             rec[key] = outputs
             if self.debug:
                 print("prompt: %s\noutputs: %s\n\n" % (self.prompt_text, outputs), flush=True)
+        if hasattr(self.model, 'memory') and hasattr(self.model.memory, 'reset'):
+            self.model.memory.reset()
+
         return records
 
     def _forward(self, model_inputs, **generate_kwargs):
@@ -242,7 +256,8 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
                                                   model_max_length=self.tokenizer.model_max_length,
                                                   prompter=self.prompter,
                                                   stop=stop,
-                                                  truncation_generation=self.truncation_generation)
+                                                  truncation_generation=self.truncation_generation,
+                                                  max_time=self.max_time)
             generate_kwargs['stopping_criteria'] = self.stopping_criteria
         generate_kwargs.pop('stop', None)
         # return super()._forward(model_inputs, **generate_kwargs)
@@ -282,6 +297,8 @@ class H2OTextGenerationPipeline(TextGenerationPipeline):
                 generate_kwargs["min_length"] += prefix_length
 
         # BS x SL
+        seed = generate_kwargs.pop('seed', 1234)
+        torch.manual_seed(seed)
         generated_sequence = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
         out_b = generated_sequence.shape[0]
         if self.framework == "pt":

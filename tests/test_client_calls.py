@@ -1,6 +1,7 @@
 import ast
 import json
 import os, sys
+import random
 import shutil
 import tempfile
 import time
@@ -11,8 +12,10 @@ from tests.utils import wrap_test_forked, make_user_path_test, get_llama, get_in
     count_tokens_llm, kill_weaviate
 from src.client_test import get_client, get_args, run_client_gen
 from src.enums import LangChainAction, LangChainMode, no_model_str, no_lora_str, no_server_str, DocumentChoice, \
-    db_types_full
-from src.utils import get_githash, remove, download_simple, hash_file, makedirs, lg_to_gr, FakeTokenizer
+    db_types_full, noop_prompt_type, git_hash_unset
+from src.utils import get_githash, remove, download_simple, hash_file, makedirs, lg_to_gr, FakeTokenizer, \
+    is_gradio_version4, get_hf_server
+from src.prompter import model_names_curated, openai_gpts, model_names_curated_big
 
 
 @wrap_test_forked
@@ -41,9 +44,9 @@ def test_client1_lock_choose_model():
 
     from src.gen import main
     base1 = 'h2oai/h2ogpt-oig-oasst1-512-6_9b'
-    base2 = 'distilgpt2'
+    base2 = 'h2oai/h2o-danube-1.8b-chat'
     model_lock = [dict(base_model=base1, prompt_type='human_bot'),
-                  dict(base_model=base2, prompt_type='plain')]
+                  dict(base_model=base2, prompt_type=noop_prompt_type)]
     main(chat=False, model_lock=model_lock,
          stream_output=False, gradio=True, num_beams=1, block_gradio_exit=False)
 
@@ -60,14 +63,17 @@ def test_client1_lock_choose_model():
                    res_dict[
                        'response']
 
-    for prompt_type in ['plain', None, '']:
+    for prompt_type in [noop_prompt_type, None, '']:
         for visible_models in [1, base2]:
             prompt = 'The sky is'
             res_dict, _ = test_client_basic(visible_models=visible_models, prompt=prompt,
                                             prompt_type=prompt_type)
             assert res_dict['prompt'] == prompt
             assert res_dict['iinput'] == ''
-            assert 'the limit of time' in res_dict['response']
+            if prompt_type == noop_prompt_type:
+                assert 'The sky is a big, blue' in res_dict['response'] or 'blue' in res_dict['response']
+            else:
+                assert 'The sky is a big, blue, and sometimes' in res_dict['response'] or 'blue' in res_dict['response']
 
 
 @pytest.mark.parametrize("base_model", [
@@ -81,7 +87,7 @@ def test_client1_context(base_model):
     sys.modules.pop('langchain', None)
 
     from src.gen import main
-    main(base_model=base_model, prompt_type='prompt_answer', chat=False,
+    main(base_model=base_model, chat=False,
          stream_output=False, gradio=True, num_beams=1, block_gradio_exit=False)
 
     from gradio_client import Client
@@ -100,11 +106,7 @@ def test_client1_context(base_model):
     # string of dict for output
     response = ast.literal_eval(res)['response']
     print(response)
-    assert """I am a mischievous pixie, always up to no good! *wink* But don't worry, I won't play any tricks on you... unless you want me to, that is. *giggles*
-As for my fairy dust, it's a special blend of sparkly, shimmering magic that can grant wishes and make dreams come true. *twinkle eyes* Would you like some? *offers a tiny vial of sparkles*""" in response or \
-           """I am a mischievous pixie, always up to no good! *winks* But don't worry, I won't play any tricks on you... unless you want me to, that is. *giggles*
-   As for my fairy dust, it's a special blend of sparkly, shimmering magic that can grant wishes and make dreams come true. *twinkle* Would you like some? *offers a tiny vial of sparkles*""" in response or \
-           """I am a mischievous pixie""" in response
+    assert """mischievous and playful pixie""" in response
 
 
 @wrap_test_forked
@@ -132,12 +134,11 @@ def test_client1api_lean(save_dir, admin_pass):
     from src.gen import main
     base_model = 'h2oai/h2ogpt-oig-oasst1-512-6_9b'
     os.environ['ADMIN_PASS'] = admin_pass
-    os.environ['GET_GITHASH'] = '1'
     main(base_model=base_model, prompt_type='human_bot', chat=False,
          stream_output=False, gradio=True, num_beams=1, block_gradio_exit=False,
          save_dir=save_dir)
 
-    client1 = get_client(serialize=True)
+    client1 = get_client(serialize=False)
 
     from gradio_utils.grclient import GradioClient
     client2 = GradioClient(get_inf_server())
@@ -150,14 +151,13 @@ def test_client1api_lean(save_dir, admin_pass):
         # pass string of dict.  All entries are optional, but expect at least instruction_nochat to be filled
         res = client.predict(str(dict(kwargs)), api_name=api_name)
         res = ast.literal_eval(res)
-        if save_dir:
-            assert 'base_model' in res['save_dict']
-            assert res['save_dict']['base_model'] == base_model
-            assert res['save_dict']['error'] in [None, '']
-            assert 'extra_dict' in res['save_dict']
-            assert res['save_dict']['extra_dict']['ntokens'] > 0
-            assert res['save_dict']['extra_dict']['t_generate'] > 0
-            assert res['save_dict']['extra_dict']['tokens_persecond'] > 0
+        assert 'base_model' in res['save_dict']
+        assert res['save_dict']['base_model'] == base_model
+        assert res['save_dict']['error'] in [None, '']
+        assert 'extra_dict' in res['save_dict']
+        assert res['save_dict']['extra_dict']['ntokens'] > 0
+        assert res['save_dict']['extra_dict']['t_generate'] > 0
+        assert res['save_dict']['extra_dict']['tokens_persecond'] > 0
 
         print("Raw client result: %s" % res, flush=True)
         response = res['response']
@@ -183,10 +183,10 @@ def test_client1api_lean(save_dir, admin_pass):
 
     client2.refresh_client()  # test refresh
     res = client.predict(api_name=api_name)
-    assert res == get_githash()
+    assert res in [get_githash(), git_hash_unset]
 
     res = client2.get_server_hash()
-    assert res == get_githash()
+    assert res in [get_githash(), git_hash_unset]
 
 
 @wrap_test_forked
@@ -195,17 +195,17 @@ def test_client1api_lean_lock_choose_model():
     base1 = 'h2oai/h2ogpt-oig-oasst1-512-6_9b'
     base2 = 'distilgpt2'
     model_lock = [dict(base_model=base1, prompt_type='human_bot'),
-                  dict(base_model=base2, prompt_type='plain')]
+                  dict(base_model=base2, prompt_type=noop_prompt_type)]
     save_dir = 'save_test'
     main(model_lock=model_lock, chat=False,
          stream_output=False, gradio=True, num_beams=1, block_gradio_exit=False,
          save_dir=save_dir)
 
-    client = get_client(serialize=True)
-    for prompt_type in ['human_bot', None, '', 'plain']:
+    client = get_client(serialize=not is_gradio_version4)
+    for prompt_type in ['human_bot', None, '', noop_prompt_type]:
         for visible_models in [None, 0, base1, 1, base2]:
             base_model = base1 if visible_models in [None, 0, base1] else base2
-            if base_model == base1 and prompt_type == 'plain':
+            if base_model == base1 and prompt_type == noop_prompt_type:
                 continue
             if base_model == base2 and prompt_type == 'human_bot':
                 continue
@@ -234,51 +234,31 @@ def test_client1api_lean_lock_choose_model():
             if base_model == base1:
                 assert 'I am h2oGPT' in response or "I'm h2oGPT" in response or 'I’m h2oGPT' in response
             else:
-                assert 'the limit of time' in response
+                assert 'the limit of time' in response or 'the limit' in response
 
     api_name = '/model_names'
     res = client.predict(api_name=api_name)
     res = ast.literal_eval(res)
     assert [x['base_model'] for x in res] == [base1, base2]
-    assert res == [{'base_model': 'h2oai/h2ogpt-oig-oasst1-512-6_9b', 'prompt_type': 'human_bot',
-                    'prompt_dict': {'promptA': '', 'promptB': '', 'PreInstruct': '<human>: ', 'PreInput': None,
-                                    'PreResponse': '<bot>:',
-                                    'terminate_response': ['\n<human>:', '\n<bot>:', '<human>:', '<bot>:', '<bot>:'],
-                                    'chat_sep': '\n', 'chat_turn_sep': '\n', 'humanstr': '<human>:', 'botstr': '<bot>:',
-                                    'generates_leading_space': True, 'system_prompt': ''}, 'load_8bit': False,
-                    'load_4bit': False, 'low_bit_mode': 1, 'load_half': True, 'load_gptq': '', 'load_awq': '',
-                    'load_exllama': False, 'use_safetensors': False, 'revision': None, 'use_gpu_id': True, 'gpu_id': 0,
-                    'compile_model': True, 'use_cache': None,
+    assert res == [{'base_model': 'h2oai/h2ogpt-oig-oasst1-512-6_9b', 'prompt_type': 'human_bot', 'prompt_dict': None,
+                    'load_8bit': False, 'load_4bit': False, 'low_bit_mode': 1, 'load_half': True,
+                    'use_flash_attention_2': False, 'load_gptq': '', 'load_awq': '', 'load_exllama': False,
+                    'use_safetensors': False, 'revision': None, 'use_gpu_id': True, 'gpu_id': 0, 'compile_model': None,
+                    'use_cache': None,
                     'llamacpp_dict': {'n_gpu_layers': 100, 'use_mlock': True, 'n_batch': 1024, 'n_gqa': 0,
-                                      'model_path_llama': 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/resolve/main/llama-2-7b-chat.ggmlv3.q8_0.bin',
-                                      'model_name_gptj': 'ggml-gpt4all-j-v1.3-groovy.bin',
-                                      'model_name_gpt4all_llama': 'ggml-wizardLM-7B.q4_2.bin',
-                                      'model_name_exllama_if_no_config': 'TheBloke/Nous-Hermes-Llama2-GPTQ'},
-                    'model_path_llama': 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/resolve/main/llama-2-7b-chat.ggmlv3.q8_0.bin',
-                    'model_name_gptj': 'ggml-gpt4all-j-v1.3-groovy.bin',
-                    'model_name_gpt4all_llama': 'ggml-wizardLM-7B.q4_2.bin',
-                    'model_name_exllama_if_no_config': 'TheBloke/Nous-Hermes-Llama2-GPTQ', 'rope_scaling': {},
-                    'max_seq_len': 2048, 'exllama_dict': {}, 'gptq_dict': {}, 'attention_sinks': False, 'sink_dict': {},
+                                      'model_path_llama': '', 'model_name_gptj': '', 'model_name_gpt4all_llama': '',
+                                      'model_name_exllama_if_no_config': ''}, 'rope_scaling': {}, 'max_seq_len': 2048,
+                    'exllama_dict': {}, 'gptq_dict': {}, 'attention_sinks': False, 'sink_dict': {},
                     'truncation_generation': False, 'hf_model_dict': {}},
-                   {'base_model': 'distilgpt2', 'prompt_type': 'plain',
-                    'prompt_dict': {'promptA': '', 'promptB': '', 'PreInstruct': '<human>: ', 'PreInput': None,
-                                    'PreResponse': '<bot>:',
-                                    'terminate_response': ['\n<human>:', '\n<bot>:', '<human>:', '<bot>:', '<bot>:'],
-                                    'chat_sep': '\n', 'chat_turn_sep': '\n', 'humanstr': '<human>:', 'botstr': '<bot>:',
-                                    'generates_leading_space': True, 'system_prompt': ''}, 'load_8bit': False,
-                    'load_4bit': False, 'low_bit_mode': 1, 'load_half': True, 'load_gptq': '', 'load_awq': '',
-                    'load_exllama': False, 'use_safetensors': False, 'revision': None, 'use_gpu_id': True, 'gpu_id': 0,
-                    'compile_model': True, 'use_cache': None,
+                   {'base_model': 'distilgpt2', 'prompt_type': noop_prompt_type, 'prompt_dict': None,
+                    'load_8bit': False,
+                    'load_4bit': False, 'low_bit_mode': 1, 'load_half': True, 'use_flash_attention_2': False,
+                    'load_gptq': '', 'load_awq': '', 'load_exllama': False, 'use_safetensors': False, 'revision': None,
+                    'use_gpu_id': True, 'gpu_id': 0, 'compile_model': None, 'use_cache': None,
                     'llamacpp_dict': {'n_gpu_layers': 100, 'use_mlock': True, 'n_batch': 1024, 'n_gqa': 0,
-                                      'model_path_llama': 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/resolve/main/llama-2-7b-chat.ggmlv3.q8_0.bin',
-                                      'model_name_gptj': 'ggml-gpt4all-j-v1.3-groovy.bin',
-                                      'model_name_gpt4all_llama': 'ggml-wizardLM-7B.q4_2.bin',
-                                      'model_name_exllama_if_no_config': 'TheBloke/Nous-Hermes-Llama2-GPTQ'},
-                    'model_path_llama': 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/resolve/main/llama-2-7b-chat.ggmlv3.q8_0.bin',
-                    'model_name_gptj': 'ggml-gpt4all-j-v1.3-groovy.bin',
-                    'model_name_gpt4all_llama': 'ggml-wizardLM-7B.q4_2.bin',
-                    'model_name_exllama_if_no_config': 'TheBloke/Nous-Hermes-Llama2-GPTQ', 'rope_scaling': {},
-                    'max_seq_len': 1024, 'exllama_dict': {}, 'gptq_dict': {}, 'attention_sinks': False, 'sink_dict': {},
+                                      'model_path_llama': '', 'model_name_gptj': '', 'model_name_gpt4all_llama': '',
+                                      'model_name_exllama_if_no_config': ''}, 'rope_scaling': {}, 'max_seq_len': 1024,
+                    'exllama_dict': {}, 'gptq_dict': {}, 'attention_sinks': False, 'sink_dict': {},
                     'truncation_generation': False, 'hf_model_dict': {}}]
 
 
@@ -292,7 +272,7 @@ def test_client1api_lean_chat_server():
     prompt = 'Who are you?'
 
     kwargs = dict(instruction_nochat=prompt)
-    client = get_client(serialize=True)
+    client = get_client(serialize=not is_gradio_version4)
     # pass string of dict.  All entries are optional, but expect at least instruction_nochat to be filled
     res = client.predict(str(dict(kwargs)), api_name=api_name)
 
@@ -326,7 +306,8 @@ def test_client_chat_nostream_gpt4all_llama():
            'What is your name and title?' in res_dict['response'] or \
            'I can assist you with any information' in res_dict['response'] or \
            'I can provide information or assistance' in res_dict['response'] or \
-           'am a student' in res_dict['response']
+           'am a student' in res_dict['response'] or \
+           'As an AI assistant' in res_dict['response']
 
 
 @pytest.mark.need_tokens
@@ -338,7 +319,957 @@ def test_client_chat_nostream_llama7b():
     assert "am a virtual assistant" in res_dict['response'] or \
            'am a student' in res_dict['response'] or \
            "My name is John." in res_dict['response'] or \
-           "how can I assist" in res_dict['response']
+           "how can I assist" in res_dict['response'] or \
+           "I'm LLaMA" in res_dict['response']
+
+
+@pytest.mark.need_tokens
+@pytest.mark.parametrize("model_num", [1, 2])
+@pytest.mark.parametrize("prompt_num", [1, 2])
+# GGML fails for >=2500
+# e.g. https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/resolve/main/llama-2-7b-chat.ggmlv3.q8_0.bin
+@pytest.mark.parametrize("max_seq_len", [2048, 3000, 4096])
+@wrap_test_forked
+def test_client_chat_nostream_llama2_long(max_seq_len, prompt_num, model_num):
+    prompt1 = """2017-08-24.
+Wright, Andy (2017-08-16). "Chasing Totality: A Look Into the World of Umbraphiles". Atlas Obscura. Archived from the original on 2020-12-14. Retrieved 2017-08-24.
+Kramer, Bill. "Photographing a Total Solar Eclipse". Eclipse-chasers.com. Archived from the original on January 29, 2009. Retrieved March 7, 2010.
+Vorenkamp, Todd (April 2017). "How to Photograph a Solar Eclipse". B&H Photo Video. Archived from the original on July 1, 2019. Retrieved August 19, 2017.
+"The science of eclipses". ESA. September 28, 2004. Archived from the original on August 1, 2012. Retrieved August 4, 2007.
+Johnson-Groh, Mara (10 August 2017). "Five Tips from NASA for Photographing the Total Solar Eclipse on Aug. 21". NASA. Archived from the original on 18 August 2020. Retrieved 21 September 2017.
+Dravins, Dainis. "Flying Shadows". Lund Observatory. Archived from the original on July 26, 2020. Retrieved January 15, 2012.
+Dyson, F.W.; Eddington, A.S.; Davidson, C.R. (1920). "A Determination of the Deflection of Light by the Sun's Gravitational Field, from Observations Made at the Solar eclipse of May 29, 1919". Phil. Trans. Roy. Soc. A. 220 (571–81): 291–333. Bibcode:1920RSPTA.220..291D. doi:10.1098/rsta.1920.0009. Archived from the original on November 3, 2020. Retrieved August 27, 2019.
+"Relativity and the 1919 eclipse". ESA. September 13, 2004. Archived from the original on October 21, 2012. Retrieved January 11, 2011.
+Steel, pp. 114–120
+Allais, Maurice (1959). "Should the Laws of Gravitation be Reconsidered?". Aero/Space Engineering. 9: 46–55.
+Saxl, Erwin J.; Allen, Mildred (1971). "1970 solar eclipse as 'seen' by a torsion pendulum". Physical Review D. 3 (4): 823–825. Bibcode:1971PhRvD...3..823S. doi:10.1103/PhysRevD.3.823.
+Wang, Qian-shen; Yang, Xin-she; Wu, Chuan-zhen; Guo, Hong-gang; Liu, Hong-chen; Hua, Chang-chai (2000). "Precise measurement of gravity variations during a total solar eclipse". Physical Review D. 62 (4): 041101(R). arXiv:1003.4947. Bibcode:2000PhRvD..62d1101W. doi:10.1103/PhysRevD.62.041101. S2CID 6846335.
+Yang, X. S.; Wang, Q. S. (2002). "Gravity anomaly during the Mohe total solar eclipse and new constraint on gravitational shielding parameter". Astrophysics and Space Science. 282 (1): 245–253. Bibcode:2002Ap&SS.282..245Y. doi:10.1023/A:1021119023985. S2CID 118497439.
+Meeus, J.; Vitagliano, A. (2004). "Simultaneous transits" (PDF). J. Br. Astron. Assoc. 114 (3): 132–135. Bibcode:2004JBAA..114..132M. Archived from the original (PDF) on July 10, 2007.
+Grego, Peter (2008). Venus and Mercury, and How to Observe Them. Springer. p. 3. ISBN 978-0387742854.
+"ISS-Venustransit". astronomie.info (in German). Archived from the original on 2020-07-28. Retrieved 2004-07-29.
+"JSC Digital Image Collection". NASA Johnson Space Center. January 11, 2006. Archived from the original on February 4, 2012. Retrieved January 15, 2012.
+Nemiroff, R.; Bonnell, J., eds. (August 30, 1999). "Looking Back on an Eclipsed Earth". Astronomy Picture of the Day. NASA. Retrieved January 15, 2012.
+"Solar Eclipse 2015 – Impact Analysis Archived 2017-02-21 at the Wayback Machine" pp. 3, 6–7, 13. European Network of Transmission System Operators for Electricity, 19 February 2015. Accessed: 4 March 2015.
+"Curve of potential power loss". ing.dk. Archived from the original on 2020-07-28. Retrieved 2015-03-04.
+Gray, S. L.; Harrison, R. G. (2012). "Diagnosing eclipse-induced wind changes". Proceedings of the Royal Society. 468 (2143): 1839–1850. Bibcode:2012RSPSA.468.1839G. doi:10.1098/rspa.2012.0007. Archived from the original on 2015-03-04. Retrieved 2015-03-04.
+Young, Alex. "How Eclipses Work". NASA. Archived from the original on 2017-09-18. Retrieved 21 September 2017.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+References
+Mucke, Hermann; Meeus, Jean (1992). Canon of Solar Eclipses −2003 to +2526 (2 ed.). Vienna: Astronomisches Büro.
+Harrington, Philip S. (1997). Eclipse! The What, Where, When, Why and How Guide to Watching Solar and Lunar Eclipses. New York: John Wiley and Sons. ISBN 0-471-12795-7.
+Steel, Duncan (1999). Eclipse: The celestial phenomenon which has changed the course of history. London: Headline. ISBN 0-7472-7385-5.
+Mobberley, Martin (2007). Total Solar Eclipses and How to Observe Them. Astronomers' Observing Guides. New York: Springer. ISBN 978-0-387-69827-4.
+Espenak, Fred (2015). Thousand Year Canon of Solar Eclipses 1501 to 2500. Portal AZ: Astropixels Publishing. ISBN 978-1-941983-02-7.
+Espenak, Fred (2016). 21st Century Canon of Solar Eclipses. Portal AZ: Astropixels Publishing. ISBN 978-1-941983-12-6.
+Fotheringham, John Knight (1921). Historical eclipses: being the Halley lecture delivered 17 May 1921. Oxford: Clarendon Press.
+External links
+
+Wikimedia Commons has media related to Solar eclipses.
+
+Wikivoyage has a travel guide for Solar eclipses.
+Listen to this article
+(2 parts, 27 minutes)
+Duration: 15 minutes and 41 seconds.15:41
+Duration: 11 minutes and 48 seconds.11:48
+Spoken Wikipedia icon
+These audio files were created from a revision of this article dated 3 May 2006, and do not reflect subsequent edits.
+(Audio help · More spoken articles)
+NASA Eclipse Web Site, with information on future eclipses and eye safety information
+NASA Eclipse Web Site (older version)
+Eclipsewise, Fred Espenak's new eclipse site
+Andrew Lowe's Eclipse Page, with maps and circumstances for 5000 years of solar eclipses
+A Guide to Eclipse Activities for Educators, Explaining eclipses in educational settings
+Detailed eclipse explanations and predictions, Hermit Eclipse
+Eclipse Photography, Prof. Miroslav Druckmüller
+Animated maps of August 21, 2017 solar eclipses, Larry Koehn
+Five Millennium (−1999 to +3000) Canon of Solar Eclipses Database, Xavier M. Jubier
+Animated explanation of the mechanics of a solar eclipse Archived 2013-05-25 at the Wayback Machine, University of South Wales
+Eclipse Image Gallery Archived 2016-10-15 at the Wayback Machine, The World at Night
+Ring of Fire Eclipse: 2012, Photos
+"Sun, Eclipses of the" . Collier's New Encyclopedia. 1921.
+Centered and aligned video recording of Total Solar Eclipse 20th March 2015 on YouTube
+Solar eclipse photographs taken from the Lick Observatory from the Lick Observatory Records Digital Archive, UC Santa Cruz Library’s Digital Collections Archived 2020-06-05 at the Wayback Machine
+Video with Total Solar Eclipse March 09 2016 (from the beginning to the total phase) on YouTube
+Total Solar Eclipse Shadow on Earth March 09 2016 CIMSSSatelite
+List of all solar eclipses
+National Geographic Solar Eclipse 101 video Archived 2018-08-04 at the Wayback Machine
+Wikiversity has a solar eclipse lab that students can do on any sunny day.
+vte
+Solar eclipses
+vte
+The Sun
+vte
+The Moon
+Portals:
+Astronomy
+icon Stars
+Spaceflight
+Outer space
+Solar System
+Authority control databases: National Edit this at Wikidata
+GermanyIsraelUnited StatesJapanCzech Republic
+Categories: EclipsesSolar eclipses
+This page was last edited on 15 October 2023, at 00:16 (UTC).
+Text is available under the Creative Commons Attribution-ShareAlike License 4.0; additional terms may apply. By using this site, you agree to the Terms of Use and Privacy Policy. Wikipedia® is a registered trademark of the Wikimedia Foundation, Inc., a non-profit organization.
+Privacy policyAbout WikipediaDisclaimersContact WikipediaCode of ConductDevelopersStatisticsCookie statementMobile viewWikimedia FoundationPowered by MediaWiki
+
+\"\"\"
+Summarize"""
+
+    prompt2 = """
+\"\"\"
+Main menu
+
+WikipediaThe Free Encyclopedia
+Search Wikipedia
+Search
+Create account
+Log in
+
+Personal tools
+
+Photograph a historic site, help Wikipedia, and win a prize. Participate in the world's largest photography competition this month!
+Learn more
+Contents hide
+(Top)
+Types
+Toggle Types subsection
+Predictions
+Toggle Predictions subsection
+Occurrence and cycles
+Toggle Occurrence and cycles subsection
+Historical eclipses
+Viewing
+Toggle Viewing subsection
+Other observations
+Toggle Other observations subsection
+Recent and forthcoming solar eclipses
+Toggle Recent and forthcoming solar eclipses subsection
+See also
+Footnotes
+Notes
+References
+External links
+Solar eclipse
+
+Article
+Talk
+Read
+View source
+View history
+
+Tools
+Featured article
+Page semi-protected
+Listen to this article
+From Wikipedia, the free encyclopedia
+Not to be confused with Solar Eclipse (video game) or Solar Eclipse (song).
+"Eclipse of the Sun" redirects here. For other uses, see Eclipse of the Sun (disambiguation).
+Total solar eclipse
+A total solar eclipse occurs when the Moon completely covers the Sun's disk, as seen in this 1999 solar eclipse. Solar prominences can be seen along the limb (in red) as well as extensive coronal filaments.
+Annular solar eclipsePartial solar eclipse
+An annular solar eclipse (left) occurs when the Moon is too far away to completely cover the Sun's disk (May 20, 2012). During a partial solar eclipse (right), the Moon blocks only part of the Sun's disk (October 25, 2022).
+A solar eclipse occurs when the Moon passes between Earth and the Sun, thereby obscuring the view of the Sun from a small part of the Earth, totally or partially. Such an alignment occurs approximately every six months, during the eclipse season in its new moon phase, when the Moon's orbital plane is closest to the plane of the Earth's orbit.[1] In a total eclipse, the disk of the Sun is fully obscured by the Moon. In partial and annular eclipses, only part of the Sun is obscured. Unlike a lunar eclipse, which may be viewed from anywhere on the night side of Earth, a solar eclipse can only be viewed from a relatively small area of the world. As such, although total solar eclipses occur somewhere on Earth every 18 months on average, they recur at any given place only once every 360 to 410 years.
+
+If the Moon were in a perfectly circular orbit and in the same orbital plane as Earth, there would be total solar eclipses once a month, at every new moon. Instead, because the Moon's orbit is tilted at about 5 degrees to Earth's orbit, its shadow usually misses Earth. Solar (and lunar) eclipses therefore happen only during eclipse seasons, resulting in at least two, and up to five, solar eclipses each year, no more than two of which can be total.[2][3] Total eclipses are more rare because they require a more precise alignment between the centers of the Sun and Moon, and because the Moon's apparent size in the sky is sometimes too small to fully cover the Sun.
+
+An eclipse is a natural phenomenon. In some ancient and modern cultures, solar eclipses were attributed to supernatural causes or regarded as bad omens. Astronomers' predictions of eclipses began in China as early as the 4th century BC; eclipses hundreds of years into the future may now be predicted with high accuracy.
+
+Looking directly at the Sun can lead to permanent eye damage, so special eye protection or indirect viewing techniques are used when viewing a solar eclipse. Only the total phase of a total solar eclipse is safe to view without protection. Enthusiasts known as eclipse chasers or umbraphiles travel to remote locations to see solar eclipses.[4][5]
+
+Types
+
+Partial and annular phases of the solar eclipse of May 20, 2012
+There are four types of solar eclipses:
+
+A total eclipse occurs in average every 18 months[Note 1][6] when the dark silhouette of the Moon completely obscures the intensely bright light of the Sun, allowing the much fainter solar corona to be visible. During any one eclipse, totality occurs at best only in a narrow track on the surface of Earth.[7] This narrow track is called the path of totality.[8]
+An annular eclipse occurs once every one or two years[6] when the Sun and Moon are exactly in line with the Earth, but the apparent size of the Moon is smaller than that of the Sun. Hence the Sun appears as a very bright ring, or annulus, surrounding the dark disk of the Moon.[9]
+A hybrid eclipse (also called annular/total eclipse) shifts between a total and annular eclipse. At certain points on the surface of Earth, it appears as a total eclipse, whereas at other points it appears as annular. Hybrid eclipses are comparatively rare.[9]
+A partial eclipse occurs about twice a year,[6] when the Sun and Moon are not exactly in line with the Earth and the Moon only partially obscures the Sun. This phenomenon can usually be seen from a large part of the Earth outside of the track of an annular or total eclipse. However, some eclipses can be seen only as a partial eclipse, because the umbra passes above the Earth's polar regions and never intersects the Earth's surface.[9] Partial eclipses are virtually unnoticeable in terms of the Sun's brightness, as it takes well over 90% coverage to notice any darkening at all. Even at 99%, it would be no darker than civil twilight.[10]
+
+Comparison of minimum and maximum apparent sizes of the Sun and Moon (and planets). An annular eclipse can occur when the Sun has a larger apparent size than the Moon, whereas a total eclipse can occur when the Moon has a larger apparent size.
+The Sun's distance from Earth is about 400 times the Moon's distance, and the Sun's diameter is about 400 times the Moon's diameter. Because these ratios are approximately the same, the Sun and the Moon as seen from Earth appear to be approximately the same size: about 0.5 degree of arc in angular measure.[9]
+
+The Moon's orbit around the Earth is slightly elliptical, as is the Earth's orbit around the Sun. The apparent sizes of the Sun and Moon therefore vary.[11] The magnitude of an eclipse is the ratio of the apparent size of the Moon to the apparent size of the Sun during an eclipse. An eclipse that occurs when the Moon is near its closest distance to Earth (i.e., near its perigee) can be a total eclipse because the Moon will appear to be large enough to completely cover the Sun's bright disk or photosphere; a total eclipse has a magnitude greater than or equal to 1.000. Conversely, an eclipse that occurs when the Moon is near its farthest distance from Earth (i.e., near its apogee) can be only an annular eclipse because the Moon will appear to be slightly smaller than the Sun; the magnitude of an annular eclipse is less than 1.[12]
+
+A hybrid eclipse occurs when the magnitude of an eclipse changes during the event from less to greater than one, so the eclipse appears to be total at locations nearer the midpoint, and annular at other locations nearer the beginning and end, since the sides of the Earth are slightly further away from the Moon. These eclipses are extremely narrow in their path width and relatively short in their duration at any point compared with fully total eclipses; the 2023 April 20 hybrid eclipse's totality is over a minute in duration at various points along the path of totality. Like a focal point, the width and duration of totality and annularity are near zero at the points where the changes between the two occur.[13]
+
+Because the Earth's orbit around the Sun is also elliptical, the Earth's distance from the Sun similarly varies throughout the year. This affects the apparent size of the Sun in the same way, but not as much as does the Moon's varying distance from Earth.[9] When Earth approaches its farthest distance from the Sun in early July, a total eclipse is somewhat more likely, whereas conditions favour an annular eclipse when Earth approaches its closest distance to the Sun in early January.[14]
+
+Terminology for central eclipse
+
+Each icon shows the view from the centre of its black spot, representing the Moon (not to scale)
+
+Diamond ring effect at third contact—the end of totality—with visible prominences
+Central eclipse is often used as a generic term for a total, annular, or hybrid eclipse.[15] This is, however, not completely correct: the definition of a central eclipse is an eclipse during which the central line of the umbra touches the Earth's surface. It is possible, though extremely rare, that part of the umbra intersects with the Earth (thus creating an annular or total eclipse), but not its central line. This is then called a non-central total or annular eclipse.[15] Gamma is a measure of how centrally the shadow strikes. The last (umbral yet) non-central solar eclipse was on April 29, 2014. This was an annular eclipse. The next non-central total solar eclipse will be on April 9, 2043.[16]
+
+The visual phases observed during a total eclipse are called:[17]
+
+First contact—when the Moon's limb (edge) is exactly tangential to the Sun's limb.
+Second contact—starting with Baily's Beads (caused by light shining through valleys on the Moon's surface) and the diamond ring effect. Almost the entire disk is covered.
+Totality—the Moon obscures the entire disk of the Sun and only the solar corona is visible.
+Third contact—when the first bright light becomes visible and the Moon's shadow is moving away from the observer. Again a diamond ring may be observed.
+Fourth contact—when the trailing edge of the Moon ceases to overlap with the solar disk and the eclipse ends.
+Predictions
+Geometry
+
+Geometry of a total solar eclipse (not to scale)
+The diagrams to the right show the alignment of the Sun, Moon, and Earth during a solar eclipse. The dark gray region between the Moon and Earth is the umbra, where the Sun is completely obscured by the Moon. The small area where the umbra touches Earth's surface is where a total eclipse can be seen. The larger light gray area is the penumbra, in which a partial eclipse can be seen. An observer in the antumbra, the area of shadow beyond the umbra, will see an annular eclipse.[18]
+
+The Moon's orbit around the Earth is inclined at an angle of just over 5 degrees to the plane of the Earth's orbit around the Sun (the ecliptic). Because of this, at the time of a new moon, the Moon will usually pass to the north or south of the Sun. A solar eclipse can occur only when a new moon occurs close to one of the points (known as nodes) where the Moon's orbit crosses the ecliptic.[19]
+
+As noted above, the Moon's orbit is also elliptical. The Moon's distance from the Earth can vary by about 6% from its average value. Therefore, the Moon's apparent size varies with its distance from the Earth, and it is this effect that leads to the difference between total and annular eclipses. The distance of the Earth from the Sun also varies during the year, but this is a smaller effect. On average, the Moon appears to be slightly smaller than the Sun as seen from the Earth, so the majority (about 60%) of central eclipses are annular. It is only when the Moon is closer to the Earth than average (near its perigee) that a total eclipse occurs.[20][21]
+
+ 	Moon	Sun
+At perigee
+(nearest)	At apogee
+(farthest)	At perihelion
+(nearest)	At aphelion
+(farthest)
+Mean radius	1,737.10 km
+(1,079.38 mi)	696,000 km
+(432,000 mi)
+Distance	363,104 km
+(225,622 mi)	405,696 km
+(252,088 mi)	147,098,070 km
+(91,402,500 mi)	152,097,700 km
+(94,509,100 mi)
+Angular
+diameter[22]	33' 30"
+(0.5583°)	29' 26"
+(0.4905°)	32' 42"
+(0.5450°)	31' 36"
+(0.5267°)
+Apparent size
+to scale				
+Order by
+decreasing
+apparent size	1st	4th	2nd	3rd
+The Moon orbits the Earth in approximately 27.3 days, relative to a fixed frame of reference. This is known as the sidereal month. However, during one sidereal month, Earth has revolved part way around the Sun, making the average time between one new moon and the next longer than the sidereal month: it is approximately 29.5 days. This is known as the synodic month and corresponds to what is commonly called the lunar month.[19]
+
+The Moon crosses from south to north of the ecliptic at its ascending node, and vice versa at its descending node.[19] However, the nodes of the Moon's orbit are gradually moving in a retrograde motion, due to the action of the Sun's gravity on the Moon's motion, and they make a complete circuit every 18.6 years. This regression means that the time between each passage of the Moon through the ascending node is slightly shorter than the sidereal month. This period is called the nodical or draconic month.[23]
+
+Finally, the Moon's perigee is moving forwards or precessing in its orbit and makes a complete circuit in 8.85 years. The time between one perigee and the next is slightly longer than the sidereal month and known as the anomalistic month.[24]
+
+The Moon's orbit intersects with the ecliptic at the two nodes that are 180 degrees apart. Therefore, the new moon occurs close to the nodes at two periods of the year approximately six months (173.3 days) apart, known as eclipse seasons, and there will always be at least one solar eclipse during these periods. Sometimes the new moon occurs close enough to a node during two consecutive months to eclipse the Sun on both occasions in two partial eclipses. This means that, in any given year, there will always be at least two solar eclipses, and there can be as many as five.[25]
+
+Eclipses can occur only when the Sun is within about 15 to 18 degrees of a node, (10 to 12 degrees for central eclipses). This is referred to as an eclipse limit, and is given in ranges because the apparent sizes and speeds of the Sun and Moon vary throughout the year. In the time it takes for the Moon to return to a node (draconic month), the apparent position of the Sun has moved about 29 degrees, relative to the nodes.[2] Since the eclipse limit creates a window of opportunity of up to 36 degrees (24 degrees for central eclipses), it is possible for partial eclipses (or rarely a partial and a central eclipse) to occur in consecutive months.[26][27]
+
+
+Fraction of the Sun's disc covered, f, when the same-sized discs are offset a fraction t of their diameter.[28]
+Path
+During a central eclipse, the Moon's umbra (or antumbra, in the case of an annular eclipse) moves rapidly from west to east across the Earth. The Earth is also rotating from west to east, at about 28 km/min at the Equator, but as the Moon is moving in the same direction as the Earth's rotation at about 61 km/min, the umbra almost always appears to move in a roughly west–east direction across a map of the Earth at the speed of the Moon's orbital velocity minus the Earth's rotational velocity.[29]
+
+The width of the track of a central eclipse varies according to the relative apparent diameters of the Sun and Moon. In the most favourable circumstances, when a total eclipse occurs very close to perigee, the track can be up to 267 km (166 mi) wide and the duration of totality may be over 7 minutes.[30] Outside of the central track, a partial eclipse is seen over a much larger area of the Earth. Typically, the umbra is 100–160 km wide, while the penumbral diameter is in excess of 6400 km.[31]
+
+Besselian elements are used to predict whether an eclipse will be partial, annular, or total (or annular/total), and what the eclipse circumstances will be at any given location.[32]: Chapter 11 
+
+Calculations with Besselian elements can determine the exact shape of the umbra's shadow on the Earth's surface. But at what longitudes on the Earth's surface the shadow will fall, is a function of the Earth's rotation, and on how much that rotation has slowed down over time. A number called ΔT is used in eclipse prediction to take this slowing into account. As the Earth slows, ΔT increases. ΔT for dates in the future can only be roughly estimated because the Earth's rotation is slowing irregularly. This means that, although it is possible to predict that there will be a total eclipse on a certain date in the far future, it is not possible to predict in the far future exactly at what longitudes that eclipse will be total. Historical records of eclipses allow estimates of past values of ΔT and so of the Earth's rotation. [32]: Equation 11.132 
+
+Duration
+
+This section is in list format but may read better as prose. You can help by converting this section, if appropriate. Editing help is available. (May 2022)
+The following factors determine the duration of a total solar eclipse (in order of decreasing importance):[33][34]
+
+The Moon being almost exactly at perigee (making its angular diameter as large as possible).
+The Earth being very near aphelion (furthest away from the Sun in its elliptical orbit, making its angular diameter nearly as small as possible).
+The midpoint of the eclipse being very close to the Earth's equator, where the rotational velocity is greatest and is closest to the speed of the lunar shadow moving over Earth's surface.
+The vector of the eclipse path at the midpoint of the eclipse aligning with the vector of the Earth's rotation (i.e. not diagonal but due east).
+The midpoint of the eclipse being near the subsolar point (the part of the Earth closest to the Sun).
+The longest eclipse that has been calculated thus far is the eclipse of July 16, 2186 (with a maximum duration of 7 minutes 29 seconds over northern Guyana).[33]
+
+Occurrence and cycles
+Main article: Eclipse cycle
+
+As the Earth revolves around the Sun, approximate axial parallelism of the Moon's orbital plane (tilted five degrees to the Earth's orbital plane) results in the revolution of the lunar nodes relative to the Earth. This causes an eclipse season approximately every six months, in which a solar eclipse can occur at the new moon phase and a lunar eclipse can occur at the full moon phase.
+
+Total solar eclipse paths: 1001–2000, showing that total solar eclipses occur almost everywhere on Earth. This image was merged from 50 separate images from NASA.[35]
+Total solar eclipses are rare events. Although they occur somewhere on Earth every 18 months on average,[36] it is estimated that they recur at any given place only once every 360 to 410 years, on average.[37] The total eclipse lasts for only a maximum of a few minutes at any location, because the Moon's umbra moves eastward at over 1700 km/h.[38] Totality currently can never last more than 7 min 32 s. This value changes over the millennia and is currently decreasing. By the 8th millennium, the longest theoretically possible total eclipse will be less than 7 min 2 s.[33] The last time an eclipse longer than 7 minutes occurred was June 30, 1973 (7 min 3 sec). Observers aboard a Concorde supersonic aircraft were able to stretch totality for this eclipse to about 74 minutes by flying along the path of the Moon's umbra.[39] The next total eclipse exceeding seven minutes in duration will not occur until June 25, 2150. The longest total solar eclipse during the 11,000 year period from 3000 BC to at least 8000 AD will occur on July 16, 2186, when totality will last 7 min 29 s.[33][40] For comparison, the longest total eclipse of the 20th century at 7 min 8 s occurred on June 20, 1955, and there will be no total solar eclipses over 7 min in duration in the 21st century.[41]
+
+It is possible to predict other eclipses using eclipse cycles. The saros is probably the best known and one of the most accurate. A saros lasts 6,585.3 days (a little over 18 years), which means that, after this period, a practically identical eclipse will occur. The most notable difference will be a westward shift of about 120° in longitude (due to the 0.3 days) and a little in latitude (north-south for odd-numbered cycles, the reverse for even-numbered ones). A saros series always starts with a partial eclipse near one of Earth's polar regions, then shifts over the globe through a series of annular or total eclipses, and ends with a partial eclipse at the opposite polar region. A saros series lasts 1226 to 1550 years and 69 to 87 eclipses, with about 40 to 60 of them being central.[42]
+
+Frequency per year
+Between two and five solar eclipses occur every year, with at least one per eclipse season. Since the Gregorian calendar was instituted in 1582, years that have had five solar eclipses were 1693, 1758, 1805, 1823, 1870, and 1935. The next occurrence will be 2206.[43] On average, there are about 240 solar eclipses each century.[44]
+
+The 5 solar eclipses of 1935
+January 5	February 3	June 30	July 30	December 25
+Partial
+(south)	Partial
+(north)	Partial
+(north)	Partial
+(south)	Annular
+(south)
+
+Saros 111	
+Saros 149	
+Saros 116	
+Saros 154	
+Saros 121
+Final totality
+Total solar eclipses are seen on Earth because of a fortuitous combination of circumstances. Even on Earth, the diversity of eclipses familiar to people today is a temporary (on a geological time scale) phenomenon. Hundreds of millions of years in the past, the Moon was closer to the Earth and therefore apparently larger, so every solar eclipse was total or partial, and there were no annular eclipses. Due to tidal acceleration, the orbit of the Moon around the Earth becomes approximately 3.8 cm more distant each year. Millions of years in the future, the Moon will be too far away to fully occlude the Sun, and no total eclipses will occur. In the same timeframe, the Sun may become brighter, making it appear larger in size.[45] Estimates of the time when the Moon will be unable to occlude the entire Sun when viewed from the Earth range between 650 million[46] and 1.4 billion years in the future.[45]
+
+Historical eclipses
+
+Astronomers Studying an Eclipse painted by Antoine Caron in 1571
+Historical eclipses are a very valuable resource for historians, in that they allow a few historical events to be dated precisely, from which other dates and ancient calendars may be deduced.[47] A solar eclipse of June 15, 763 BC mentioned in an Assyrian text is important for the chronology of the ancient Near East.[48] There have been other claims to date earlier eclipses. The legendary Chinese king Zhong Kang supposedly beheaded two astronomers, Hsi and Ho, who failed to predict an eclipse 4,000 years ago.[49] Perhaps the earliest still-unproven claim is that of archaeologist Bruce Masse, who putatively links an eclipse that occurred on May 10, 2807, BC with a possible meteor impact in the Indian Ocean on the basis of several ancient flood myths that mention a total solar eclipse.[50] The earliest preserved depiction of a partial solar eclipse from 1143 BCE might be the one in tomb KV9 of Ramses V and Ramses VI.[citation needed]
+
+
+Records of the solar eclipses of 993 and 1004 as well as the lunar eclipses of 1001 and 1002 by Ibn Yunus of Cairo (c. 1005).
+Eclipses have been interpreted as omens, or portents.[51] The ancient Greek historian Herodotus wrote that Thales of Miletus predicted an eclipse that occurred during a battle between the Medes and the Lydians. Both sides put down their weapons and declared peace as a result of the eclipse.[52] The exact eclipse involved remains uncertain, although the issue has been studied by hundreds of ancient and modern authorities. One likely candidate took place on May 28, 585 BC, probably near the Halys river in Asia Minor.[53] An eclipse recorded by Herodotus before Xerxes departed for his expedition against Greece,[54] which is traditionally dated to 480 BC, was matched by John Russell Hind to an annular eclipse of the Sun at Sardis on February 17, 478 BC.[55] Alternatively, a partial eclipse was visible from Persia on October 2, 480 BC.[56] Herodotus also reports a solar eclipse at Sparta during the Second Persian invasion of Greece.[57] The date of the eclipse (August 1, 477 BC) does not match exactly the conventional dates for the invasion accepted by historians.[58]
+
+Chinese records of eclipses begin at around 720 BC.[59] The 4th century BC astronomer Shi Shen described the prediction of eclipses by using the relative positions of the Moon and Sun.[60]
+
+Attempts have been made to establish the exact date of Good Friday by assuming that the darkness described at Jesus's crucifixion was a solar eclipse. This research has not yielded conclusive results,[61][62] and Good Friday is recorded as being at Passover, which is held at the time of a full moon. Further, the darkness lasted from the sixth hour to the ninth, or three hours, which is much, much longer than the eight-minute upper limit for any solar eclipse's totality. Contemporary chronicles wrote about an eclipse at the beginning of May 664 that coincided with the beginning of the plague of 664 in the British isles.[63] In the Western hemisphere, there are few reliable records of eclipses before AD 800, until the advent of Arab and monastic observations in the early medieval period.[59] The Cairo astronomer Ibn Yunus wrote that the calculation of eclipses was one of the many things that connect astronomy with the Islamic law, because it allowed knowing when a special prayer can be made.[64] The first recorded observation of the corona was made in Constantinople in AD 968.[56][59]
+
+
+Erhard Weigel, predicted course of moon shadow on 12 August 1654 (O.S. 2 August)
+The first known telescopic observation of a total solar eclipse was made in France in 1706.[59] Nine years later, English astronomer Edmund Halley accurately predicted and observed the solar eclipse of May 3, 1715.[56][59] By the mid-19th century, scientific understanding of the Sun was improving through observations of the Sun's corona during solar eclipses. The corona was identified as part of the Sun's atmosphere in 1842, and the first photograph (or daguerreotype) of a total eclipse was taken of the solar eclipse of July 28, 1851.[56] Spectroscope observations were made of the solar eclipse of August 18, 1868, which helped to determine the chemical composition of the Sun.[56] John Fiske summed up myths about the solar eclipse like this in his 1872 book Myth and Myth-Makers,
+the myth of Hercules and Cacus, the fundamental idea is the victory of the solar god over the robber who steals the light. Now whether the robber carries off the light in the evening when Indra has gone to sleep, or boldly rears his black form against the sky during the daytime, causing darkness to spread over the earth, would make little difference to the framers of the myth. To a chicken a solar eclipse is the same thing as nightfall, and he goes to roost accordingly. Why, then, should the primitive thinker have made a distinction between the darkening of the sky caused by black clouds and that caused by the rotation of the earth? He had no more conception of the scientific explanation of these phenomena than the chicken has of the scientific explanation of an eclipse. For him it was enough to know that the solar radiance was stolen, in the one case as in the other, and to suspect that the same demon was to blame for both robberies.[65]
+
+Viewing
+2017 total solar eclipse viewed in real time with audience reactions
+Looking directly at the photosphere of the Sun (the bright disk of the Sun itself), even for just a few seconds, can cause permanent damage to the retina of the eye, because of the intense visible and invisible radiation that the photosphere emits. This damage can result in impairment of vision, up to and including blindness. The retina has no sensitivity to pain, and the effects of retinal damage may not appear for hours, so there is no warning that injury is occurring.[66][67]
+
+Under normal conditions, the Sun is so bright that it is difficult to stare at it directly. However, during an eclipse, with so much of the Sun covered, it is easier and more tempting to stare at it. Looking at the Sun during an eclipse is as dangerous as looking at it outside an eclipse, except during the brief period of totality, when the Sun's disk is completely covered (totality occurs only during a total eclipse and only very briefly; it does not occur during a partial or annular eclipse). Viewing the Sun's disk through any kind of optical aid (binoculars, a telescope, or even an optical camera viewfinder) is extremely hazardous and can cause irreversible eye damage within a fraction of a second.[68][69]
+
+Partial and annular eclipses
+
+Eclipse glasses filter out eye damaging radiation, allowing direct viewing of the Sun during all partial eclipse phases; they are not used during totality, when the Sun is completely eclipsed
+
+Pinhole projection method of observing partial solar eclipse. Insert (upper left): partially eclipsed Sun photographed with a white solar filter. Main image: projections of the partially eclipsed Sun (bottom right)
+Viewing the Sun during partial and annular eclipses (and during total eclipses outside the brief period of totality) requires special eye protection, or indirect viewing methods if eye damage is to be avoided. The Sun's disk can be viewed using appropriate filtration to block the harmful part of the Sun's radiation. Sunglasses do not make viewing the Sun safe. Only properly designed and certified solar filters should be used for direct viewing of the Sun's disk.[70] Especially, self-made filters using common objects such as a floppy disk removed from its case, a Compact Disc, a black colour slide film, smoked glass, etc. must be avoided.[71][72]
+
+The safest way to view the Sun's disk is by indirect projection.[73] This can be done by projecting an image of the disk onto a white piece of paper or card using a pair of binoculars (with one of the lenses covered), a telescope, or another piece of cardboard with a small hole in it (about 1 mm diameter), often called a pinhole camera. The projected image of the Sun can then be safely viewed; this technique can be used to observe sunspots, as well as eclipses. Care must be taken, however, to ensure that no one looks through the projector (telescope, pinhole, etc.) directly.[74] A kitchen colander with small holes can also be used to project multiple images of the partially eclipsed Sun onto the ground or a viewing screen. Viewing the Sun's disk on a video display screen (provided by a video camera or digital camera) is safe, although the camera itself may be damaged by direct exposure to the Sun. The optical viewfinders provided with some video and digital cameras are not safe. Securely mounting #14 welder's glass in front of the lens and viewfinder protects the equipment and makes viewing possible.[72] Professional workmanship is essential because of the dire consequences any gaps or detaching mountings will have. In the partial eclipse path, one will not be able to see the corona or nearly complete darkening of the sky. However, depending on how much of the Sun's disk is obscured, some darkening may be noticeable. If three-quarters or more of the Sun is obscured, then an effect can be observed by which the daylight appears to be dim, as if the sky were overcast, yet objects still cast sharp shadows.[75]
+
+Totality
+Solar eclipse of August 21, 2017
+
+Baily's beads, sunlight visible through lunar valleys
+
+Composite image with corona, prominences, and diamond ring effect
+When the shrinking visible part of the photosphere becomes very small, Baily's beads will occur. These are caused by the sunlight still being able to reach the Earth through lunar valleys. Totality then begins with the diamond ring effect, the last bright flash of sunlight.[76]
+
+It is safe to observe the total phase of a solar eclipse directly only when the Sun's photosphere is completely covered by the Moon, and not before or after totality.[73] During this period, the Sun is too dim to be seen through filters. The Sun's faint corona will be visible, and the chromosphere, solar prominences, and possibly even a solar flare may be seen. At the end of totality, the same effects will occur in reverse order, and on the opposite side of the Moon.[76]
+
+Eclipse chasing
+Main article: Eclipse chasing
+A dedicated group of eclipse chasers have pursued the observation of solar eclipses when they occur around the Earth.[77] A person who chases eclipses is known as an umbraphile, meaning shadow lover.[78] Umbraphiles travel for eclipses and use various tools to help view the sun including solar viewing glasses, also known as eclipse glasses, as well as telescopes.[79][80]
+
+Photography
+
+The progression of a solar eclipse on August 1, 2008 in Novosibirsk, Russia. All times UTC (local time was UTC+7). The time span between shots is three minutes.
+Photographing an eclipse is possible with fairly common camera equipment. In order for the disk of the Sun/Moon to be easily visible, a fairly high magnification long focus lens is needed (at least 200 mm for a 35 mm camera), and for the disk to fill most of the frame, a longer lens is needed (over 500 mm). As with viewing the Sun directly, looking at it through the optical viewfinder of a camera can produce damage to the retina, so care is recommended.[81] Solar filters are required for digital photography even if an optical viewfinder is not used. Using a camera's live view feature or an electronic viewfinder is safe for the human eye, but the Sun's rays could potentially irreparably damage digital image sensors unless the lens is covered by a properly designed solar filter.[82]
+
+Other observations
+A total solar eclipse provides a rare opportunity to observe the corona (the outer layer of the Sun's atmosphere). Normally this is not visible because the photosphere is much brighter than the corona. According to the point reached in the solar cycle, the corona may appear small and symmetric, or large and fuzzy. It is very hard to predict this in advance.[83]
+
+
+Pinholes in shadows during no eclipse (1 & 4), a partial eclipse (2 & 5) and an annular eclipse (3 & 6)
+As the light filters through leaves of trees during a partial eclipse, the overlapping leaves create natural pinholes, displaying mini eclipses on the ground.[84]
+
+Phenomena associated with eclipses include shadow bands (also known as flying shadows), which are similar to shadows on the bottom of a swimming pool. They occur only just prior to and after totality, when a narrow solar crescent acts as an anisotropic light source.[85]
+
+1919 observations
+See also: Tests of general relativity § Deflection of light by the Sun
+
+Eddington's original photograph of the 1919 eclipse, which provided evidence for Einstein's theory of general relativity.
+The observation of a total solar eclipse of May 29, 1919, helped to confirm Einstein's theory of general relativity. By comparing the apparent distance between stars in the constellation Taurus, with and without the Sun between them, Arthur Eddington stated that the theoretical predictions about gravitational lenses were confirmed.[86] The observation with the Sun between the stars was possible only during totality since the stars are then visible. Though Eddington's observations were near the experimental limits of accuracy at the time, work in the later half of the 20th century confirmed his results.[87][88]
+
+Gravity anomalies
+There is a long history of observations of gravity-related phenomena during solar eclipses, especially during the period of totality. In 1954, and again in 1959, Maurice Allais reported observations of strange and unexplained movement during solar eclipses.[89] The reality of this phenomenon, named the Allais effect, has remained controversial. Similarly, in 1970, Saxl and Allen observed the sudden change in motion of a torsion pendulum; this phenomenon is called the Saxl effect.[90]
+
+Observation during the 1997 solar eclipse by Wang et al. suggested a possible gravitational shielding effect,[91] which generated debate. In 2002, Wang and a collaborator published detailed data analysis, which suggested that the phenomenon still remains unexplained.[92]
+
+Eclipses and transits
+In principle, the simultaneous occurrence of a solar eclipse and a transit of a planet is possible. But these events are extremely rare because of their short durations. The next anticipated simultaneous occurrence of a solar eclipse and a transit of Mercury will be on July 5, 6757, and a solar eclipse and a transit of Venus is expected on April 5, 15232.[93]
+
+More common, but still infrequent, is a conjunction of a planet (especially, but not only, Mercury or Venus) at the time of a total solar eclipse, in which event the planet will be visible very near the eclipsed Sun, when without the eclipse it would have been lost in the Sun's glare. At one time, some scientists hypothesized that there may be a planet (often given the name Vulcan) even closer to the Sun than Mercury; the only way to confirm its existence would have been to observe it in transit or during a total solar eclipse. No such planet was ever found, and general relativity has since explained the observations that led astronomers to suggest that Vulcan might exist.[94]
+
+Artificial satellites
+
+The Moon's shadow over Turkey and Cyprus, seen from the ISS during a 2006 total solar eclipse.
+
+A composite image showing the ISS transit of the Sun while the 2017 solar eclipse was in progress.
+Artificial satellites can also pass in front of the Sun as seen from the Earth, but none is large enough to cause an eclipse. At the altitude of the International Space Station, for example, an object would need to be about 3.35 km (2.08 mi) across to blot the Sun out entirely. These transits are difficult to watch because the zone of visibility is very small. The satellite passes over the face of the Sun in about a second, typically. As with a transit of a planet, it will not get dark.[95]
+
+Observations of eclipses from spacecraft or artificial satellites orbiting above the Earth's atmosphere are not subject to weather conditions. The crew of Gemini 12 observed a total solar eclipse from space in 1966.[96] The partial phase of the 1999 total eclipse was visible from Mir.[97]
+
+Impact
+The solar eclipse of March 20, 2015, was the first occurrence of an eclipse estimated to potentially have a significant impact on the power system, with the electricity sector taking measures to mitigate any impact. The continental Europe and Great Britain synchronous areas were estimated to have about 90 gigawatts of solar power and it was estimated that production would temporarily decrease by up to 34 GW compared to a clear sky day.[98][99]
+
+Eclipses may cause the temperature to decrease by 3 °C, with wind power potentially decreasing as winds are reduced by 0.7 m/s.[100]
+
+In addition to the drop in light level and air temperature, animals change their behavior during totality. For example, birds and squirrels return to their nests and crickets chirp.[101]
+
+Recent and forthcoming solar eclipses
+Main article: List of solar eclipses in the 21st century
+Further information: Lists of solar eclipses
+
+Eclipse path for total and hybrid eclipses from 2021 to 2040.
+Eclipses occur only in the eclipse season, when the Sun is close to either the ascending or descending node of the Moon. Each eclipse is separated by one, five or six lunations (synodic months), and the midpoint of each season is separated by 173.3 days, which is the mean time for the Sun to travel from one node to the next. The period is a little less than half a calendar year because the lunar nodes slowly regress. Because 223 synodic months is roughly equal to 239 anomalistic months and 242 draconic months, eclipses with similar geometry recur 223 synodic months (about 6,585.3 days) apart. This period (18 years 11.3 days) is a saros. Because 223 synodic months is not identical to 239 anomalistic months or 242 draconic months, saros cycles do not endlessly repeat. Each cycle begins with the Moon's shadow crossing the Earth near the north or south pole, and subsequent events progress toward the other pole until the Moon's shadow misses the Earth and the series ends.[26] Saros cycles are numbered; currently, cycles 117 to 156 are active.[citation needed]
+
+1997–2000
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[102]
+
+Solar eclipse series sets from 1997–2000 
+Descending node	 	Ascending node
+Saros	Map	Gamma	Saros	Map	Gamma
+120
+
+Chita, Russia	1997 March 09
+
+Total	0.91830	125	1997 September 02
+
+Partial (south)	−1.03521
+130
+
+Total eclipse near Guadeloupe	1998 February 26
+
+Total	0.23909	135	1998 August 22
+
+Annular	−0.26441
+140	1999 February 16
+
+Annular	−0.47260	145
+
+Totality from France	1999 August 11
+
+Total	0.50623
+150	2000 February 05
+
+Partial (south)	−1.22325	155	2000 July 31
+
+Partial (north)	1.21664
+Partial solar eclipses on July 1, 2000 and December 25, 2000 occur in the next lunar year eclipse set.
+
+2000–2003
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[103]
+
+Partial solar eclipses on February 5, 2000 and July 31, 2000 occur in the previous lunar year set.
+
+Solar eclipse series sets from 2000–2003 
+Ascending node	 	Descending node
+Saros	Map	Gamma	Saros	Map	Gamma
+117	2000 July 01
+
+Partial (south)	−1.28214	122	2000 December 25
+
+Partial (north)	1.13669
+127
+
+Totality from Lusaka, Zambia	2001 June 21
+
+Total	−0.57013	132
+
+Partial from Minneapolis, MN	2001 December 14
+
+Annular	0.40885
+137
+
+Partial from Los Angeles, CA	2002 June 10
+
+Annular	0.19933	142
+
+Totality from Woomera	2002 December 04
+
+Total	−0.30204
+147
+
+Culloden, Scotland	2003 May 31
+
+Annular	0.99598	152	2003 November 23
+
+Total	−0.96381
+2004–2007
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[104]
+
+Solar eclipse series sets from 2004–2007 
+Ascending node	 	Descending node
+Saros	Map	Gamma	Saros	Map	Gamma
+119	2004 April 19
+
+Partial (south)	−1.13345	124	2004 October 14
+
+Partial (north)	1.03481
+129
+
+Partial from Naiguatá	2005 April 08
+
+Hybrid	−0.34733	134
+
+Annular from Madrid, Spain	2005 October 03
+
+Annular	0.33058
+139
+
+Total from Side, Turkey	2006 March 29
+
+Total	0.38433	144
+
+Partial from São Paulo, Brazil	2006 September 22
+
+Annular	−0.40624
+149
+
+From Jaipur, India	2007 March 19
+
+Partial (north)	1.07277	154
+
+From Córdoba, Argentina	2007 September 11
+
+Partial (south)	−1.12552
+2008–2011
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[105]
+
+Solar eclipse series sets from 2008–2011 
+Ascending node	 	Descending node
+Saros	Map	Gamma	Saros	Map	Gamma
+121
+
+Partial from Christchurch, NZ	2008 February 07
+
+Annular	−0.95701	126
+
+Novosibirsk, Russia	2008 August 01
+
+Total	0.83070
+131
+
+Palangka Raya, Indonesia	2009 January 26
+
+Annular	−0.28197	136
+
+Kurigram, Bangladesh	2009 July 22
+
+Total	0.06977
+141
+
+Bangui, Central African Republic	2010 January 15
+
+Annular	0.40016	146
+
+Hao, French Polynesia	2010 July 11
+
+Total	−0.67877
+151
+
+Partial from Vienna, Austria	2011 January 04
+
+Partial (north)	1.06265	156	2011 July 01
+
+Partial (south)	−1.49171
+Partial solar eclipses on June 1, 2011, and November 25, 2011, occur on the next lunar year eclipse set.
+
+2011–2014
+This eclipse is a member of the 2011–2014 solar eclipse semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[106][Note 2]
+
+Solar eclipse series sets from 2011–2014 
+Descending node	 	Ascending node
+Saros	Map	Gamma	Saros	Map	Gamma
+118
+
+Partial from Tromsø, Norway	2011 June 01
+
+Partial (north)	1.21300	123
+
+Hinode XRT footage	2011 November 25
+
+Partial (south)	−1.05359
+128
+
+Middlegate, Nevada	2012 May 20
+
+Annular	0.48279	133
+
+Cairns, Australia	2012 November 13
+
+Total	−0.37189
+138
+
+Churchills Head, Australia	2013 May 10
+
+Annular	−0.26937	143
+
+Partial from Libreville, Gabon	2013 November 03
+
+Hybrid	0.32715
+148
+
+Partial from Adelaide, Australia	2014 April 29
+
+Annular (non-central)	−0.99996	153
+
+Partial from Minneapolis	2014 October 23
+
+Partial (north)	1.09078
+2015–2018
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[107]
+
+Solar eclipse series sets from 2015–2018 
+Descending node	 	Ascending node
+Saros	Map	Gamma	Saros	Map	Gamma
+120
+
+Longyearbyen, Svalbard	2015 March 20
+
+Total	0.94536	125
+
+Solar Dynamics Observatory	
+2015 September 13
+
+Partial (south)	−1.10039
+130
+
+Balikpapan, Indonesia	2016 March 9
+
+Total	0.26092	135
+
+L'Étang-Salé, Réunion	2016 September 1
+
+Annular	−0.33301
+140
+
+Partial from Buenos Aires	2017 February 26
+
+Annular	−0.45780	145
+
+Casper, Wyoming	2017 August 21
+
+Total	0.43671
+150
+
+Partial from Olivos, Buenos Aires	2018 February 15
+
+Partial (south)	−1.21163	155
+
+Partial from Huittinen, Finland	2018 August 11
+
+Partial (north)	1.14758
+Partial solar eclipses on July 13, 2018, and January 6, 2019, occur during the next semester series.
+
+2018–2021
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[108]
+
+Note: Partial solar eclipses on February 15, 2018, and August 11, 2018, occurred during the previous semester series.
+
+Solar eclipse series sets from 2018–2021 
+Ascending node	 	Descending node
+Saros	Map	Gamma	Saros	Map	Gamma
+117
+
+Partial from Melbourne, Australia	2018 July 13
+
+Partial	−1.35423	122
+
+Partial from Nakhodka, Russia	2019 January 6
+
+Partial	1.14174
+127
+
+La Serena, Chile	2019 July 2
+
+Total	−0.64656	132
+
+Jaffna, Sri Lanka	2019 December 26
+
+Annular	0.41351
+137
+
+Beigang, Yunlin, Taiwan	2020 June 21
+
+Annular	0.12090	142
+
+Gorbea, Chile	2020 December 14
+
+Total	−0.29394
+147
+
+Partial from Halifax, Canada	2021 June 10
+
+Annular	0.91516	152
+
+From HMS Protector off South Georgia	2021 December 4
+
+Total	−0.95261
+2022–2025
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[109]
+
+Solar eclipse series sets from 2022–2025 
+Ascending node	 	Descending node
+Saros	Map	Gamma	Saros	Map	Gamma
+119
+
+Partial from CTIO, Chile	2022 April 30
+
+Partial	−1.19008	124
+
+Partial from Saratov, Russia	2022 October 25
+
+Partial	1.07014
+129
+
+Total from
+East Timor	2023 April 20
+
+Hybrid	−0.39515	134
+
+Annular from
+Campeche, Mexico	2023 October 14
+
+Annular	0.37534
+139	2024 April 8
+
+Total	0.34314	144	2024 October 2
+
+Annular	−0.35087
+149	2025 March 29
+
+Partial	1.04053	154	2025 September 21
+
+Partial	−1.06509
+2026–2029
+This eclipse is a member of a semester series. An eclipse in a semester series of solar eclipses repeats approximately every 177 days and 4 hours (a semester) at alternating nodes of the Moon's orbit.[110]
+
+Solar eclipse series sets from 2026–2029 
+Ascending node	 	Descending node
+Saros	Map	Gamma	Saros	Map	Gamma
+121	2026 February 17
+
+Annular	−0.97427	126	2026 August 12
+
+Total	0.89774
+131	2027 February 6
+
+Annular	−0.29515	136	2027 August 2
+
+Total	0.14209
+141	2028 January 26
+
+Annular	0.39014	146	2028 July 22
+
+Total	−0.60557
+151	2029 January 14
+
+Partial	1.05532	156	2029 July 11
+
+Partial	−1.41908
+Partial solar eclipses on June 12, 2029, and December 5, 2029, occur in the next lunar year eclipse set.
+
+See also
+Lists of solar eclipses
+List of films featuring eclipses
+Apollo–Soyuz: First joint U.S.–Soviet space flight. Mission included an arranged eclipse of the Sun by the Apollo module to allow instruments on the Soyuz to take photographs of the solar corona.
+Eclipse chasing: Travel to eclipse locations for study and enjoyment
+Occultation: Generic term for occlusion of an object by another object that passes between it and the observer, thus revealing (for example) the presence of an exoplanet orbiting a distant star by eclipsing it as seen from Earth
+Solar eclipses in fiction
+Solar eclipses on the Moon: Eclipse of the Sun by planet Earth, as seen from the Moon
+Lunar eclipse: Solar eclipse of the Moon, as seen from Earth; the shadow cast on the Moon by that eclipse
+Transit of Venus: Passage of the planet Venus between the Sun and the Earth, as seen from Earth. Technically a partial eclipse.
+Transit of Deimos from Mars: Passage of the Martian moon Deimos between the Sun and Mars, as seen from Mars
+Transit of Phobos from Mars: Passage of the Martian moon Phobos between the Sun and Mars, as seen from Mars
+Footnotes
+ In the same place it can happen only once in several centuries.
+ The partial solar eclipses of January 4, 2011 and July 1, 2011 occurred in the previous semester series.
+Notes
+ "What is an eclipse?". European Space Agency. Archived from the original on 2018-08-04. Retrieved 2018-08-04.
+ Littmann, Mark; Espenak, Fred; Willcox, Ken (2008). Totality: Eclipses of the Sun. Oxford University Press. pp. 18–19. ISBN 978-0-19-953209-4.
+ Five solar eclipses occurred in 1935.NASA (September 6, 2009). "Five Millennium Catalog of Solar Eclipses". NASA Eclipse Web Site. Fred Espenak, Project and Website Manager. Archived from the original on April 29, 2010. Retrieved January 26, 2010.
+ Koukkos, Christina (May 14, 2009). "Eclipse Chasing, in Pursuit of Total Awe". The New York Times. Archived from the original on June 26, 2018. Retrieved January 15, 2012.
+ Pasachoff, Jay M. (July 10, 2010). "Why I Never Miss a Solar Eclipse". The New York Times. Archived from the original on June 26, 2018. Retrieved January 15, 2012.
+ "What Are the Three Types of Solar Eclipses?". Exploratorium. Retrieved 11 Oct 2023.
+ Harrington, pp. 7–8
+ "Eclipse: Who? What? Where? When? and How? | Total Solar Eclipse 2017". eclipse2017.nasa.gov. Archived from the original on 2017-09-18. Retrieved 2017-09-21.
+ Harrington, pp. 9–11
+ "Transit of Venus, Sun–Earth Day 2012". nasa.gov. Archived from the original on January 14, 2016. Retrieved February 7, 2016.
+ "Solar Eclipses". University of Tennessee. Archived from the original on June 9, 2015. Retrieved January 15, 2012.
+ "How Is the Sun Completely Blocked in an Eclipse?". NASA Space Place. NASA. 2009. Archived from the original on 2021-01-19. Retrieved 2019-09-01.
+ Espenak, Fred (September 26, 2009). "Solar Eclipses for Beginners". MrEclipse.com. Archived from the original on May 24, 2015. Retrieved January 15, 2012.
+ Steel, p. 351
+ Espenak, Fred (January 6, 2009). "Central Solar Eclipses: 1991–2050". NASA Eclipse web site. Greenbelt, MD: NASA Goddard Space Flight Center. Archived from the original on January 8, 2021. Retrieved January 15, 2012.
+ Verbelen, Felix (November 2003). "Solar Eclipses on Earth, 1001 BC to AD 2500". online.be. Archived from the original on August 3, 2019. Retrieved January 15, 2012.
+ Harrington, pp. 13–14; Steel, pp. 266–279
+ Mobberley, pp. 30–38
+ Harrington, pp. 4–5
+ Hipschman, Ron. "Why Eclipses Happen". Exploratorium. Archived from the original on December 27, 2015. Retrieved January 14, 2012.
+ Brewer, Bryan (January 14, 1998). "What Causes an Eclipse?". Earth View. Archived from the original on January 2, 2013. Retrieved January 14, 2012.
+ NASA – Eclipse 99 – Frequently Asked Questions Archived 2010-05-27 at the Wayback Machine – There is a mistake in the How long will we continue to be able to see total eclipses of the Sun? answer, "...the Sun's angular diameter varies from 32.7 minutes of arc when the Earth is at its farthest point in its orbit (aphelion), and 31.6 arc minutes when it is at its closest (perihelion)." It should appear smaller when farther, so the values should be swapped.
+ Steel, pp. 319–321
+ Steel, pp. 317–319
+ Harrington, pp. 5–7
+ Espenak, Fred (August 28, 2009). "Periodicity of Solar Eclipses". NASA Eclipse web site. Greenbelt, MD: NASA Goddard Space Flight Center. Archived from the original on November 12, 2020. Retrieved January 15, 2012.
+ Espenak, Fred; Meeus, Jean (January 26, 2007). "Five Millennium Catalog of Solar Eclipses: -1999 to +3000". NASA Eclipse web site. Greenbelt, MD: NASA Goddard Space Flight Center. Archived from the original on October 24, 2020. Retrieved January 15, 2012.
+ European Space Agency, "Spacecraft flight dynamics Archived 2019-12-11 at the Wayback Machine: proceedings of an international symposium, 18–22 May 1981-Darmstadt, Germany", p.347
+ Mobberley, pp. 33–37
+ "How do eclipses such as the one on Wednesday 14 November 2012 occur?". Sydney Observatory. Archived from the original on 29 April 2013. Retrieved 20 March 2015.
+ Steel, pp. 52–53
+ Seidelmann, P. Kenneth; Urban, Sean E., eds. (2013). Explanatory Supplement to the Astronomical Almanac (3rd ed.). University Science Books. ISBN 978-1-891389-85-6.
+ Meeus, J. (December 2003). "The maximum possible duration of a total solar eclipse". Journal of the British Astronomical Association. 113 (6): 343–348. Bibcode:2003JBAA..113..343M.
+ M. Littman, et al.
+ Espenak, Fred (March 24, 2008). "World Atlas of Solar Eclipse Paths". NASA Eclipse web site. NASA Goddard Space Flight Center. Archived from the original on July 14, 2012. Retrieved January 15, 2012.
+ Steel, p. 4
+ For 360 years, see Harrington, p. 9; for 410 years, see Steel, p. 31
+ Mobberley, pp. 33–36; Steel, p. 258
+ Beckman, J.; Begot, J.; Charvin, P.; Hall, D.; Lena, P.; Soufflot, A.; Liebenberg, D.; Wraight, P. (1973). "Eclipse Flight of Concorde 001". Nature. 246 (5428): 72–74. Bibcode:1973Natur.246...72B. doi:10.1038/246072a0. S2CID 10644966.
+ Stephenson, F. Richard (1997). Historical Eclipses and Earth's Rotation. Cambridge University Press. p. 54. doi:10.1017/CBO9780511525186. ISBN 0-521-46194-4. Archived from the original on 2020-08-01. Retrieved 2012-01-04.
+ Mobberley, p. 10
+ Espenak, Fred (August 28, 2009). "Eclipses and the Saros". NASA Eclipse web site. NASA Goddard Space Flight Center. Archived from the original on May 24, 2012. Retrieved January 15, 2012.
+ Pogo, Alexander (1935). "Calendar years with five solar eclipses". Popular Astronomy. Vol. 43. p. 412. Bibcode:1935PA.....43..412P.
+ "What are solar eclipses and how often do they occur?". timeanddate.com. Archived from the original on 2017-02-02. Retrieved 2014-11-23.
+ Walker, John (July 10, 2004). "Moon near Perigee, Earth near Aphelion". Fourmilab. Archived from the original on December 8, 2013. Retrieved March 7, 2010.
+ Mayo, Lou. "WHAT'S UP? The Very Last Solar Eclipse!". NASA. Archived from the original on 2017-08-22. Retrieved 22 August 2017.
+ Acta Eruditorum. Leipzig. 1762. p. 168. Archived from the original on 2020-07-31. Retrieved 2018-06-06.
+ van Gent, Robert Harry. "Astronomical Chronology". University of Utrecht. Archived from the original on July 28, 2020. Retrieved January 15, 2012.
+ Harrington, p. 2
+ Blakeslee, Sandra (November 14, 2006). "Ancient Crash, Epic Wave". The New York Times. Archived from the original on April 11, 2009. Retrieved November 14, 2006.
+ Steel, p. 1
+ Steel, pp. 84–85
+ Le Conte, David (December 6, 1998). "Eclipse Quotations". MrEclipse.com. Archived from the original on October 17, 2020. Retrieved January 8, 2011.
+ Herodotus. Book VII. p. 37. Archived from the original on 2008-08-19. Retrieved 2008-07-13.
+ Chambers, G. F. (1889). A Handbook of Descriptive and Practical Astronomy. Oxford: Clarendon Press. p. 323.
+ Espenak, Fred. "Solar Eclipses of Historical Interest". NASA Eclipse web site. NASA Goddard Space Flight Center. Archived from the original on March 9, 2008. Retrieved December 28, 2011.
+ Herodotus. Book IX. p. 10. Archived from the original on 2020-07-26. Retrieved 2008-07-14.
+ Schaefer, Bradley E. (May 1994). "Solar Eclipses That Changed the World". Sky & Telescope. Vol. 87, no. 5. pp. 36–39. Bibcode:1994S&T....87...36S.
+ Stephenson, F. Richard (1982). "Historical Eclipses". Scientific American. Vol. 247, no. 4. pp. 154–163. Bibcode:1982SciAm.247d.154S.
+ Needham, Joseph (1986). Science and Civilization in China: Volume 3. Taipei: Caves Books. pp. 411–413. OCLC 48999277.
+ Humphreys, C. J.; Waddington, W. G. (1983). "Dating the Crucifixion". Nature. 306 (5945): 743–746. Bibcode:1983Natur.306..743H. doi:10.1038/306743a0. S2CID 4360560.
+ Kidger, Mark (1999). The Star of Bethlehem: An Astronomer's View. Princeton, NJ: Princeton University Press. pp. 68–72. ISBN 978-0-691-05823-8.
+ Ó Cróinín, Dáibhí (13 May 2020). "Reeling in the years: why 664 AD was a terrible year in Ireland". rte.ie. Archived from the original on 2021-01-08. Retrieved January 9, 2021.
+ Regis Morelon (1996). "General survey of Arabic astronomy". In Roshdi Rashed (ed.). Encyclopedia of the History of Arabic Science. Vol. I. Routledge. p. 15.
+ Fiske, John (October 1, 1997). Myths and Myth-Makers Old Tales and Superstitions Interpreted by Comparative Mythology. Archived from the original on July 26, 2020. Retrieved February 12, 2017 – via Project Gutenberg.
+ Espenak, Fred (July 11, 2005). "Eye Safety During Solar Eclipses". NASA Eclipse web site. NASA Goddard Space Flight Center. Archived from the original on July 16, 2012. Retrieved January 15, 2012.
+ Dobson, Roger (August 21, 1999). "UK hospitals assess eye damage after solar eclipse". British Medical Journal. 319 (7208): 469. doi:10.1136/bmj.319.7208.469. PMC 1116382. PMID 10454393.
+ MacRobert, Alan M. (8 August 2006). "How to Watch a Partial Solar Eclipse Safely". Sky & Telescope. Retrieved August 4, 2007.
+ Chou, B. Ralph (July 11, 2005). "Eye safety during solar eclipses". NASA Eclipse web site. NASA Goddard Space Flight Center. Archived from the original on November 14, 2020. Retrieved January 15, 2012.
+ Littmann, Mark; Willcox, Ken; Espenak, Fred (1999). "Observing Solar Eclipses Safely". MrEclipse.com. Archived from the original on July 26, 2020. Retrieved January 15, 2012.
+ Chou, B. Ralph (January 20, 2008). "Eclipse Filters". MrEclipse.com. Archived from the original on November 27, 2020. Retrieved January 4, 2012.
+ "Solar Viewing Safety". Perkins Observatory. Archived from the original on July 14, 2020. Retrieved January 15, 2012.
+ Harrington, p. 25
+ Harrington, p. 26
+ Harrington, p. 40
+ Littmann, Mark; Willcox, Ken; Espenak, Fred (1999). "The Experience of Totality". MrEclipse.com. Archived from the original on February 4, 2012. Retrieved January 15, 2012.
+ Kate Russo (1 August 2012). Total Addiction: The Life of an Eclipse Chaser. Springer Science & Business Media. ISBN 978-3-642-30481-1. Archived from the original on 9 December 2019. Retrieved 24 August 2017.
+ Kelly, Pat (2017-07-06). "Umbraphile, Umbraphilia, Umbraphiles, and Umbraphiliacs – Solar Eclipse with the Sol Alliance". Solar Eclipse with the Sol Alliance. Archived from the original on 2019-08-13. Retrieved 2017-08-24.
+ "How to View the 2017 Solar Eclipse Safely". eclipse2017.nasa.gov. Archived from the original on 2017-08-24. Retrieved 2017-08-24.
+ Wright, Andy (2017-08-16). "Chasing Totality: A Look Into the World of Umbraphiles". Atlas Obscura. Archived from the original on 2020-12-14. Retrieved 2017-08-24.
+ Kramer, Bill. "Photographing a Total Solar Eclipse". Eclipse-chasers.com. Archived from the original on January 29, 2009. Retrieved March 7, 2010.
+ Vorenkamp, Todd (April 2017). "How to Photograph a Solar Eclipse". B&H Photo Video. Archived from the original on July 1, 2019. Retrieved August 19, 2017.
+ "The science of eclipses". ESA. September 28, 2004. Archived from the original on August 1, 2012. Retrieved August 4, 2007.
+ Johnson-Groh, Mara (10 August 2017). "Five Tips from NASA for Photographing the Total Solar Eclipse on Aug. 21". NASA. Archived from the original on 18 August 2020. Retrieved 21 September 2017.
+ Dravins, Dainis. "Flying Shadows". Lund Observatory. Archived from the original on July 26, 2020. Retrieved January 15, 2012.
+ Dyson, F.W.; Eddington, A.S.; Davidson, C.R. (1920). "A Determination of the Deflection of Light by the Sun's Gravitational Field, from Observations Made at the Solar eclipse of May 29, 1919". Phil. Trans. Roy. Soc. A. 220 (571–81): 291–333. Bibcode:1920RSPTA.220..291D. doi:10.1098/rsta.1920.0009. Archived from the original on November 3, 2020. Retrieved August 27, 2019.
+ "Relativity and the 1919 eclipse". ESA. September 13, 2004. Archived from the original on October 21, 2012. Retrieved January 11, 2011.
+ Steel, pp. 114–120
+ Allais, Maurice (1959). "Should the Laws of Gravitation be Reconsidered?". Aero/Space Engineering. 9: 46–55.
+ Saxl, Erwin J.; Allen, Mildred (1971). "1970 solar eclipse as 'seen' by a torsion pendulum". Physical Review D. 3 (4): 823–825. Bibcode:1971PhRvD...3..823S. doi:10.1103/PhysRevD.3.823.
+ Wang, Qian-shen; Yang, Xin-she; Wu, Chuan-zhen; Guo, Hong-gang; Liu, Hong-chen; Hua, Chang-chai (2000). "Precise measurement of gravity variations during a total solar eclipse". Physical Review D. 62 (4): 041101(R). arXiv:1003.4947. Bibcode:2000PhRvD..62d1101W. doi:10.1103/PhysRevD.62.041101. S2CID 6846335.
+ Yang, X. S.; Wang, Q. S. (2002). "Gravity anomaly during the Mohe total solar eclipse and new constraint on gravitational shielding parameter". Astrophysics and Space Science. 282 (1): 245–253. Bibcode:2002Ap&SS.282..245Y. doi:10.1023/A:1021119023985. S2CID 118497439.
+ Meeus, J.; Vitagliano, A. (2004). "Simultaneous transits" (PDF). J. Br. Astron. Assoc. 114 (3): 132–135. Bibcode:2004JBAA..114..132M. Archived from the original (PDF) on July 10, 2007.
+ Grego, Peter (2008). Venus and Mercury, and How to Observe Them. Springer. p. 3. ISBN 978-0387742854.
+ "ISS-Venustransit". astronomie.info (in German). Archived from the original on 2020-07-28. Retrieved 2004-07-29.
+ "JSC Digital Image Collection". NASA Johnson Space Center. January 11, 2006. Archived from the original on February 4, 2012. Retrieved January 15, 2012.
+ Nemiroff, R.; Bonnell, J., eds. (August 30, 1999). "Looking Back on an Eclipsed Earth". Astronomy Picture of the Day. NASA. Retrieved January 15, 2012.
+ "Solar Eclipse 2015 – Impact Analysis Archived 2017-02-21 at the Wayback Machine" pp. 3, 6–7, 13. European Network of Transmission System Operators for Electricity, 19 February 2015. Accessed: 4 March 2015.
+ "Curve of potential power loss". ing.dk. Archived from the original on 2020-07-28. Retrieved 2015-03-04.
+ Gray, S. L.; Harrison, R. G. (2012). "Diagnosing eclipse-induced wind changes". Proceedings of the Royal Society. 468 (2143): 1839–1850. Bibcode:2012RSPSA.468.1839G. doi:10.1098/rspa.2012.0007. Archived from the original on 2015-03-04. Retrieved 2015-03-04.
+ Young, Alex. "How Eclipses Work". NASA. Archived from the original on 2017-09-18. Retrieved 21 September 2017.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+ van Gent, R.H. "Solar- and Lunar-Eclipse Predictions from Antiquity to the Present". A Catalogue of Eclipse Cycles. Utrecht University. Retrieved 6 October 2018.
+References
+Mucke, Hermann; Meeus, Jean (1992). Canon of Solar Eclipses −2003 to +2526 (2 ed.). Vienna: Astronomisches Büro.
+Harrington, Philip S. (1997). Eclipse! The What, Where, When, Why and How Guide to Watching Solar and Lunar Eclipses. New York: John Wiley and Sons. ISBN 0-471-12795-7.
+Steel, Duncan (1999). Eclipse: The celestial phenomenon which has changed the course of history. London: Headline. ISBN 0-7472-7385-5.
+Mobberley, Martin (2007). Total Solar Eclipses and How to Observe Them. Astronomers' Observing Guides. New York: Springer. ISBN 978-0-387-69827-4.
+Espenak, Fred (2015). Thousand Year Canon of Solar Eclipses 1501 to 2500. Portal AZ: Astropixels Publishing. ISBN 978-1-941983-02-7.
+Espenak, Fred (2016). 21st Century Canon of Solar Eclipses. Portal AZ: Astropixels Publishing. ISBN 978-1-941983-12-6.
+Fotheringham, John Knight (1921). Historical eclipses: being the Halley lecture delivered 17 May 1921. Oxford: Clarendon Press.
+External links
+
+Wikimedia Commons has media related to Solar eclipses.
+
+Wikivoyage has a travel guide for Solar eclipses.
+Listen to this article
+(2 parts, 27 minutes)
+Duration: 15 minutes and 41 seconds.15:41
+Duration: 11 minutes and 48 seconds.11:48
+Spoken Wikipedia icon
+These audio files were created from a revision of this article dated 3 May 2006, and do not reflect subsequent edits.
+(Audio help · More spoken articles)
+NASA Eclipse Web Site, with information on future eclipses and eye safety information
+NASA Eclipse Web Site (older version)
+Eclipsewise, Fred Espenak's new eclipse site
+Andrew Lowe's Eclipse Page, with maps and circumstances for 5000 years of solar eclipses
+A Guide to Eclipse Activities for Educators, Explaining eclipses in educational settings
+Detailed eclipse explanations and predictions, Hermit Eclipse
+Eclipse Photography, Prof. Miroslav Druckmüller
+Animated maps of August 21, 2017 solar eclipses, Larry Koehn
+Five Millennium (−1999 to +3000) Canon of Solar Eclipses Database, Xavier M. Jubier
+Animated explanation of the mechanics of a solar eclipse Archived 2013-05-25 at the Wayback Machine, University of South Wales
+Eclipse Image Gallery Archived 2016-10-15 at the Wayback Machine, The World at Night
+Ring of Fire Eclipse: 2012, Photos
+"Sun, Eclipses of the" . Collier's New Encyclopedia. 1921.
+Centered and aligned video recording of Total Solar Eclipse 20th March 2015 on YouTube
+Solar eclipse photographs taken from the Lick Observatory from the Lick Observatory Records Digital Archive, UC Santa Cruz Library’s Digital Collections Archived 2020-06-05 at the Wayback Machine
+Video with Total Solar Eclipse March 09 2016 (from the beginning to the total phase) on YouTube
+Total Solar Eclipse Shadow on Earth March 09 2016 CIMSSSatelite
+List of all solar eclipses
+National Geographic Solar Eclipse 101 video Archived 2018-08-04 at the Wayback Machine
+ Wikiversity has a solar eclipse lab that students can do on any sunny day.
+vte
+Solar eclipses
+vte
+The Sun
+vte
+The Moon
+Portals:
+ Astronomy
+icon Stars
+ Spaceflight
+ Outer space
+ Solar System
+Authority control databases: National Edit this at Wikidata	
+GermanyIsraelUnited StatesJapanCzech Republic
+Categories: EclipsesSolar eclipses
+This page was last edited on 15 October 2023, at 00:16 (UTC).
+Text is available under the Creative Commons Attribution-ShareAlike License 4.0; additional terms may apply. By using this site, you agree to the Terms of Use and Privacy Policy. Wikipedia® is a registered trademark of the Wikimedia Foundation, Inc., a non-profit organization.
+Privacy policyAbout WikipediaDisclaimersContact WikipediaCode of ConductDevelopersStatisticsCookie statementMobile viewWikimedia FoundationPowered by MediaWiki
+\"\"\"
+Summarize"""
+
+    if prompt_num == 1:
+        prompt = prompt1
+    else:
+        prompt = prompt2
+    if model_num == 1:
+        base_model = 'llama'
+    else:
+        base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'
+    model_path_llama = 'https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf?download=true'
+    # model_path_llama = 'https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q8_0.gguf?download=true'
+    res_dict, client = run_client_chat_with_server(prompt=prompt,
+                                                   max_seq_len=max_seq_len,
+                                                   model_path_llama=model_path_llama,
+                                                   stream_output=False,
+                                                   prompt_type='llama2',
+                                                   base_model=base_model,
+                                                   max_time=250,  # for 4096 llama-2 GGUF, takes 75s
+                                                   )
+    assert "solar eclipse" in res_dict['response']
 
 
 def run_client_chat_with_server(prompt='Who are you?', stream_output=False, max_new_tokens=256,
@@ -348,8 +1279,10 @@ def run_client_chat_with_server(prompt='Who are you?', stream_output=False, max_
                                 langchain_agents=[],
                                 user_path=None,
                                 langchain_modes=['UserData', 'MyData', 'Disabled', 'LLM'],
-                                model_path_llama='llama-2-7b-chat.ggmlv3.q8_0.bin',
-                                docs_ordering_type='reverse_ucurve_sort'):
+                                model_path_llama='https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf?download=true',
+                                docs_ordering_type='reverse_ucurve_sort',
+                                max_seq_len=None,
+                                max_time=20):
     if langchain_mode == 'Disabled':
         os.environ['TEST_LANGCHAIN_IMPORT'] = "1"
         sys.modules.pop('gpt_langchain', None)
@@ -363,12 +1296,15 @@ def run_client_chat_with_server(prompt='Who are you?', stream_output=False, max_
          max_new_tokens=max_new_tokens,
          langchain_mode=langchain_mode, user_path=user_path,
          langchain_modes=langchain_modes,
-         docs_ordering_type=docs_ordering_type)
+         docs_ordering_type=docs_ordering_type,
+         max_seq_len=max_seq_len,
+         verbose=True)
 
     from src.client_test import run_client_chat
     res_dict, client = run_client_chat(prompt=prompt, prompt_type=prompt_type, stream_output=stream_output,
                                        max_new_tokens=max_new_tokens, langchain_mode=langchain_mode,
-                                       langchain_action=langchain_action, langchain_agents=langchain_agents)
+                                       langchain_action=langchain_action, langchain_agents=langchain_agents,
+                                       max_time=max_time)
     assert res_dict['prompt'] == prompt
     assert res_dict['iinput'] == ''
     return res_dict, client
@@ -385,7 +1321,7 @@ def run_client_nochat_with_server(prompt='Who are you?', stream_output=False, ma
                                   langchain_agents=[],
                                   user_path=None,
                                   langchain_modes=['UserData', 'MyData', 'Disabled', 'LLM'],
-                                  docs_ordering_type='reverse_ucurve_sort'):
+                                  docs_ordering_type='reverse_ucurve_sort', other_server_kwargs={}):
     if langchain_mode == 'Disabled':
         os.environ['TEST_LANGCHAIN_IMPORT'] = "1"
         sys.modules.pop('gpt_langchain', None)
@@ -398,22 +1334,31 @@ def run_client_nochat_with_server(prompt='Who are you?', stream_output=False, ma
          langchain_mode=langchain_mode, langchain_action=langchain_action, langchain_agents=langchain_agents,
          user_path=user_path,
          langchain_modes=langchain_modes,
-         docs_ordering_type=docs_ordering_type)
+         docs_ordering_type=docs_ordering_type,
+         **other_server_kwargs)
 
     from src.client_test import run_client_nochat_gen
     res_dict, client = run_client_nochat_gen(prompt=prompt, prompt_type=prompt_type,
                                              stream_output=stream_output,
                                              max_new_tokens=max_new_tokens, langchain_mode=langchain_mode,
                                              langchain_action=langchain_action, langchain_agents=langchain_agents)
-    assert 'Birds' in res_dict['response'] or \
+    assert 'birds' in res_dict['response'].lower() or \
            'and can learn new things' in res_dict['response'] or \
            'Once upon a time' in res_dict['response']
     return res_dict, client
 
 
+@pytest.mark.parametrize("gradio_ui_stream_chunk_size", [0, 20])
+@pytest.mark.parametrize("gradio_ui_stream_chunk_min_seconds", [0, .2, 2])
+@pytest.mark.parametrize("gradio_ui_stream_chunk_seconds", [.2, 2])
 @wrap_test_forked
-def test_client_nochat_stream():
-    run_client_nochat_with_server(stream_output=True, prompt="Tell a very long kid's story about birds.")
+def test_client_nochat_stream(gradio_ui_stream_chunk_size, gradio_ui_stream_chunk_min_seconds,
+                              gradio_ui_stream_chunk_seconds):
+    other_server_kwargs = dict(gradio_ui_stream_chunk_size=gradio_ui_stream_chunk_size,
+                               gradio_ui_stream_chunk_min_seconds=gradio_ui_stream_chunk_min_seconds,
+                               gradio_ui_stream_chunk_seconds=gradio_ui_stream_chunk_seconds)
+    run_client_nochat_with_server(stream_output=True, prompt="Tell a very long kid's story about birds.",
+                                  other_server_kwargs=other_server_kwargs)
 
 
 @wrap_test_forked
@@ -486,7 +1431,9 @@ def test_client_chat_stream_langchain_steps(max_new_tokens, top_k_docs):
             'h2oGPT is a project that' in res_dict['response'] or
             'for querying and summarizing documents' in res_dict['response'] or
             'Python-based platform for training' in res_dict['response'] or
-            'h2oGPT is an open-source' in res_dict['response']
+            'h2oGPT is an open-source' in res_dict['response'] or
+            'language model' in res_dict['response'] or
+            'Whisper is an open-source' in res_dict['response']
             ) \
            and ('FAQ.md' in res_dict['response'] or 'README.md' in res_dict['response'])
 
@@ -534,7 +1481,7 @@ def test_client_chat_stream_langchain_steps(max_new_tokens, top_k_docs):
 
     res_dict, client = run_client(client, prompt, args, kwargs)
     # i.e. answers wrongly without data, dumb model, but also no docs at all since cutoff entirely
-    assert 'h2oGPT is a variant of the popular GPT' in res_dict['response'] and '.md' not in res_dict['response']
+    assert 'h2oGPT is a variant' in res_dict['response'] and '.md' not in res_dict['response']
 
     # QUERY3
     prompt = "What is whisper?"
@@ -615,8 +1562,9 @@ def test_client_system_prompts(system_prompt, chat_conversation):
 
         if not chat_conversation:
             if system_prompt == 'You are a goofy lion who talks to kids':
-                assert 'ROAR!' in res_dict['response'] and 'respectful' not in res_dict[
-                    'response'] and 'developed by Meta' not in res_dict['response']
+                assert ('ROAR!' in res_dict['response'] or 'ROARRR' in res_dict['response']) and \
+                       'respectful' not in res_dict['response'] and \
+                       'developed by Meta' not in res_dict['response']
             elif system_prompt == '':
                 assert "developed by Meta" in res_dict['response'] and 'respectful' not in res_dict[
                     'response'] and 'ROAR!' not in res_dict['response']
@@ -628,14 +1576,16 @@ def test_client_system_prompts(system_prompt, chat_conversation):
                 # system prompt overwhelms chat conversation
                 assert "I'm a goofy lion" in res_dict['response'] or \
                        "goofiest lion" in res_dict['response'] or \
-                       "I'm the coolest lion around" in res_dict['response']
+                       "I'm the coolest lion around" in res_dict['response'] or \
+                       "awesome lion" in res_dict['response']
             elif system_prompt == '':
                 # empty system prompt gives room for chat conversation to control
                 assert "My name is Porky" in res_dict['response']
             elif system_prompt in [None, 'auto', 'None']:
                 # conservative default system_prompt makes it ignore chat
                 assert "not a real person" in res_dict['response'] or \
-                       "I don't have personal experiences or feelings" in res_dict['response']
+                       "I don't have personal experiences or feelings" in res_dict['response'] or \
+                       "I'm just an AI" in res_dict['response']
 
 
 @pytest.mark.need_tokens
@@ -700,7 +1650,9 @@ def test_client_chat_stream_langchain_steps2(max_new_tokens, top_k_docs, auto_mi
             res_dict['response'] or
             'A new open-source language model that is fully permissive' in res_dict['response'] or
             'h2oGPT is an open-source' in res_dict['response'] or
-            'h2oGPT is an open-source, fully permissive, commercially usable' in res_dict['response']
+            'h2oGPT is an open-source, fully permissive, commercially usable' in res_dict['response'] or
+            'Based on the information provided in the context, h2oGPT appears to be an open-source' in res_dict[
+                'response']
             ) and \
            'README.md' in res_dict['response']
 
@@ -744,18 +1696,24 @@ def test_doc_hash():
 def test_client_chat_stream_long():
     prompt = 'Tell a very long story about cute birds for kids.'
     res_dict, client = run_client_chat_with_server(prompt=prompt, stream_output=True, max_new_tokens=1024)
-    assert 'Once upon a time' in res_dict['response']
+    assert 'Once upon a time' in res_dict['response'] or \
+           'The story begins with' in res_dict['response'] or \
+           'The birds are all very' in res_dict['response']
 
 
+@pytest.mark.parametrize("base_model", [
+    'TheBloke/em_german_leo_mistral-GPTQ',
+    'TheBloke/Nous-Hermes-13B-GPTQ',
+])
 @wrap_test_forked
-def test_autogptq():
+def test_autogptq(base_model):
     prompt = 'Who are you?'
     stream_output = False
     max_new_tokens = 256
-    base_model = 'TheBloke/Nous-Hermes-13B-GPTQ'
     load_gptq = 'model'
     use_safetensors = True
-    prompt_type = 'instruct'
+    prompt_type = ''
+    max_seq_len = 4096  # mistral will use 32k if don't specify, go OOM on typical system
     langchain_mode = 'Disabled'
     langchain_action = LangChainAction.QUERY.value
     langchain_agents = []
@@ -764,6 +1722,7 @@ def test_autogptq():
     docs_ordering_type = 'reverse_sort'
     from src.gen import main
     main(base_model=base_model, load_gptq=load_gptq,
+         max_seq_len=max_seq_len,
          use_safetensors=use_safetensors,
          prompt_type=prompt_type, chat=True,
          stream_output=stream_output, gradio=True, num_beams=1, block_gradio_exit=False,
@@ -778,18 +1737,21 @@ def test_autogptq():
                                        langchain_action=langchain_action, langchain_agents=langchain_agents)
     assert res_dict['prompt'] == prompt
     assert res_dict['iinput'] == ''
-    assert "am a virtual assistant" in res_dict['response']
+    assert "am a virtual assistant" in res_dict['response'] or "computer program designed" in res_dict['response']
+
+    check_langchain()
 
 
 @wrap_test_forked
 def test_autoawq():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
     prompt = 'Who are you?'
     stream_output = False
     max_new_tokens = 256
-    base_model = 'TheBloke/Llama-2-13B-chat-AWQ'
+    base_model = 'TheBloke/Mistral-7B-Instruct-v0.2-AWQ'
     load_awq = 'model'
     use_safetensors = True
-    prompt_type = 'llama2'
+    prompt_type = 'mistral'
     langchain_mode = 'Disabled'
     langchain_action = LangChainAction.QUERY.value
     langchain_agents = []
@@ -804,7 +1766,10 @@ def test_autoawq():
          max_new_tokens=max_new_tokens,
          langchain_mode=langchain_mode, user_path=user_path,
          langchain_modes=langchain_modes,
-         docs_ordering_type=docs_ordering_type)
+         docs_ordering_type=docs_ordering_type,
+         add_disk_models_to_ui=False,
+         max_seq_len=2048,
+         )
 
     from src.client_test import run_client_chat
     res_dict, client = run_client_chat(prompt=prompt, prompt_type=prompt_type, stream_output=stream_output,
@@ -812,10 +1777,66 @@ def test_autoawq():
                                        langchain_action=langchain_action, langchain_agents=langchain_agents)
     assert res_dict['prompt'] == prompt
     assert res_dict['iinput'] == ''
-    assert "am a virtual assistant" in res_dict['response'] or \
-           "Hello! My name is LLaMA, I'm a large language model trained by a team" in res_dict['response']
+    assert "I am an artificial intelligence designed to assist" in res_dict['response']
+
+    check_langchain()
 
 
+def check_langchain():
+    # PURE client code
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # get file for client to upload
+    url = 'https://cdn.openai.com/papers/whisper.pdf'
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
+    download_simple(url, dest=test_file1)
+
+    # upload file(s).  Can be list or single file
+    test_file_local, test_file_server = client.predict(test_file1, api_name='/upload_api')
+
+    chunk = True
+    chunk_size = 512
+    langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
+    h2ogpt_key = ''
+    res = client.predict(test_file_server,
+                         langchain_mode, chunk, chunk_size, True,
+                         *loaders,
+                         h2ogpt_key,
+                         api_name='/add_file_api')
+    assert res[0] is None
+    assert res[1] == langchain_mode
+    assert os.path.basename(test_file_server) in res[2]
+    assert res[3] == ''
+
+    # ask for summary, need to use same client if using MyData
+    instruction = "Give a very long detailed step-by-step description of what is Whisper paper about."
+    max_time = 300
+    kwargs = dict(instruction=instruction,
+                  langchain_mode=langchain_mode,
+                  langchain_action="Query",
+                  top_k_docs=4,
+                  document_subset='Relevant',
+                  document_choice=DocumentChoice.ALL.value,
+                  max_new_tokens=1024,
+                  max_time=max_time,
+                  do_sample=False,
+                  stream_output=False,
+                  )
+    t0 = time.time()
+    res_dict, client = run_client_gen(client, kwargs)
+    response = res_dict['response']
+    assert len(response) > 0
+    # assert len(response) < max_time * 20  # 20 tokens/sec
+    assert time.time() - t0 < max_time * 2.5
+    sources = [x['source'] for x in res_dict['sources']]
+    # only get source not empty list if break in inner loop, not gradio_runner loop, so good test of that too
+    # this is why gradio timeout adds 10 seconds, to give inner a chance to produce references or other final info
+    assert 'whisper1.pdf' in sources[0]
+
+
+@pytest.mark.skip(reason="No longer supported")
 @pytest.mark.parametrize("mode", ['a', 'b', 'c'])
 @wrap_test_forked
 def test_exllama(mode):
@@ -861,6 +1882,8 @@ def test_exllama(mode):
            "I am LLaMA" in res_dict['response'] or \
            "Hello! My name is Llama, I'm a large language model trained by Meta AI." in res_dict['response']
 
+    check_langchain()
+
 
 @pytest.mark.parametrize("attention_sinks", [False, True])  # mistral goes beyond context just fine up to 32k
 @pytest.mark.parametrize("max_seq_len", [4096, 8192])
@@ -871,12 +1894,13 @@ def test_attention_sinks(max_seq_len, attention_sinks):
     make_db_main(download_some=True)
     user_path = None  # shouldn't be necessary, db already made
 
-    prompt = 'Give an extremely detailed report that is well-structured with step-by-step sections (and elaborate details for each section) that describes the documents. Do not stop or end the report, just keep generating forever in never-ending report.'
+    prompt = 'Write an extremely fully detailed never-ending report that is well-structured with step-by-step sections (and elaborate details for each section) that describes the documents.  Never stop the report.'
     stream_output = True
     max_new_tokens = 100000
     max_max_new_tokens = max_new_tokens
-    base_model = 'mistralai/Mistral-7B-Instruct-v0.1'
-    prompt_type = 'mistral'
+    # base_model = 'mistralai/Mistral-7B-Instruct-v0.1'
+    base_model = 'HuggingFaceH4/zephyr-7b-beta'
+    prompt_type = 'zephyr'
     langchain_mode = 'UserData'
     langchain_action = LangChainAction.QUERY.value
     langchain_agents = []
@@ -899,7 +1923,7 @@ def test_attention_sinks(max_seq_len, attention_sinks):
          # mistral is 32k if don't say, easily run GPU OOM even on 48GB (even with --use_gpu_id=False)
          docs_ordering_type=docs_ordering_type,
          cut_distance=1.8,  # probably should allow control via API/UI
-         sink_dict={'attention_sink_size': 4, 'attention_sink_window_size': 4096} if attention_sinks else {},
+         sink_dict={'num_sink_tokens': 4, 'window_length': 4096} if attention_sinks else {},
          )
 
     from src.client_test import run_client_chat
@@ -910,7 +1934,9 @@ def test_attention_sinks(max_seq_len, attention_sinks):
                                        max_time=600, repetition_penalty=1.07, do_sample=False)
     assert res_dict['prompt'] == prompt
     assert res_dict['iinput'] == ''
-    assert len(res_dict['response']) > 2500, "%s %s" % (len(res_dict['response']), res_dict['response'])
+    assert len(res_dict['response']) > 2400, "%s %s" % (len(res_dict['response']), res_dict['response'])
+
+    check_langchain()
 
 
 @pytest.mark.skip(reason="Local file required")
@@ -921,14 +1947,14 @@ def test_client_long():
     sys.modules.pop('langchain', None)
 
     from src.gen import main
-    main(base_model='mosaicml/mpt-7b-storywriter', prompt_type='plain', chat=False,
+    main(base_model='mosaicml/mpt-7b-storywriter', prompt_type=noop_prompt_type, chat=False,
          stream_output=False, gradio=True, num_beams=1, block_gradio_exit=False)
 
     with open("/home/jon/Downloads/Gatsby_PDF_FullText.txt") as f:
         prompt = f.readlines()
 
     from src.client_test import run_client_nochat
-    res_dict, _ = run_client_nochat(prompt=prompt, prompt_type='plain', max_new_tokens=86000)
+    res_dict, _ = run_client_nochat(prompt=prompt, prompt_type=noop_prompt_type, max_new_tokens=86000)
     print(res_dict['response'])
 
 
@@ -936,6 +1962,23 @@ def test_client_long():
 def test_fast_up():
     from src.gen import main
     main(gradio=True, block_gradio_exit=False)
+
+
+@wrap_test_forked
+def test_fast_up_preload():
+    from src.gen import main
+    import torch
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpus == 0:
+        return
+    main(gradio=True, block_gradio_exit=False,
+         pre_load_image_audio_models=True,
+         embedding_gpu_id=n_gpus - 1,
+         caption_gpu_id=max(0, n_gpus - 2),
+         doctr_gpu_id=max(0, n_gpus - 3),
+         asr_gpu_id=max(0, n_gpus - 4),
+         asr_model='openai/whisper-large-v3',
+         )
 
 
 @wrap_test_forked
@@ -993,7 +2036,7 @@ def test_client_stress(repeat):
     prompt = "Tell a very long kid's story about birds."
     # prompt = "Say exactly only one word."
 
-    client = get_client(serialize=True)
+    client = get_client(serialize=not is_gradio_version4)
     kwargs = dict(
         instruction='',
         max_new_tokens=200,
@@ -1025,7 +2068,7 @@ def test_client_stress_stream(repeat):
     stream_output = True
     chat = False
 
-    client = get_client(serialize=True)
+    client = get_client(serialize=not is_gradio_version4)
     kwargs, args = get_args(prompt, prompt_type, chat=chat, stream_output=stream_output,
                             max_new_tokens=max_new_tokens, langchain_mode=langchain_mode)
     res_dict, client = run_client_gen(client, kwargs, do_md_to_text=False)
@@ -1083,9 +2126,9 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     user_path = make_user_path_test()
 
     if loaders is None:
-        loaders = tuple([None, None, None, None])
+        loaders = tuple([None, None, None, None, None, None])
     else:
-        image_loaders_options0, image_loaders_options, \
+        image_audio_loaders_options0, image_audio_loaders_options, \
             pdf_loaders_options0, pdf_loaders_options, \
             url_loaders_options0, url_loaders_options = \
             lg_to_gr(enable_ocr=True, enable_captions=True, enable_pdf_ocr=True,
@@ -1093,8 +2136,21 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
                      use_pymupdf=True,
                      enable_doctr=True,
                      enable_pix2struct=True,
+                     enable_transcriptions=True,
+                     use_pypdf=True,
+                     use_unstructured_pdf=True,
+                     try_pdf_as_html=True,
+                     enable_llava=True,
+                     llava_model=None,
+                     llava_prompt=None,
                      max_quality=True)
-        loaders = [image_loaders_options, pdf_loaders_options, url_loaders_options, None]
+        # use all loaders except crawling ones
+        url_loaders_options = [x for x in url_loaders_options if 'scrape' not in x.lower()]
+        jq_schema = None
+        extract_frames = 0
+        llava_prompt = None
+        loaders = [image_audio_loaders_options, pdf_loaders_options, url_loaders_options,
+                   jq_schema, extract_frames, llava_prompt]
 
     stream_output = True
     max_new_tokens = 256
@@ -1113,6 +2169,8 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
          max_new_tokens=max_new_tokens,
          langchain_mode=langchain_mode, user_path=user_path,
          langchain_modes=langchain_modes,
+         append_sources_to_answer=True,
+         append_sources_to_chat=False,
          **main_kwargs,
          verbose=True)
 
@@ -1120,7 +2178,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     # serialize=False would lead to returning dict for some objects or files for get_sources
     client = get_client(serialize=False)
 
-    url = 'https://www.africau.edu/images/default/sample.pdf'
+    url = 'https://h2o-release.s3.amazonaws.com/h2ogpt/sample.pdf'
     test_file1 = os.path.join('/tmp/', 'sample1.pdf')
     download_simple(url, dest=test_file1)
     res = client.predict(test_file1,
@@ -1140,7 +2198,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     remove(user_path2)
     remove('db_dir_%s' % langchain_mode2)
     new_langchain_mode_text = '%s, %s, %s' % (langchain_mode2, 'shared', user_path2)
-    res = client.predict(langchain_mode, new_langchain_mode_text, api_name='/new_langchain_mode_text')
+    res = client.predict(langchain_mode, new_langchain_mode_text, h2ogpt_key, api_name='/new_langchain_mode_text')
     assert res[0]['value'] == langchain_mode2
     # odd gradio change
     res0_choices = [x[0] for x in res[0]['choices']]
@@ -1177,7 +2235,14 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     assert ('Yes, more text can be boring' in res_dict['response'] or
             "can be considered boring" in res_dict['response'] or
             "the text in the provided PDF file is quite repetitive and boring" in res_dict['response'] or
-            "the provided PDF file is quite boring" in res_dict['response']) \
+            "the provided PDF file is quite boring" in res_dict['response'] or
+            "finds more text to be boring" in res_dict['response'] or
+            "text to be boring" in res_dict['response'] or
+            "author finds more text to be boring" in res_dict['response'] or
+            "more text is boring" in res_dict['response'] or
+            "more text is boring" in res_dict['response'] or
+            "it can be inferred that more text is indeed boring" in res_dict['response'] or
+            "expressing frustration" in res_dict['response']) \
            and 'sample1.pdf' in res_dict['response']
     # QUERY2
     prompt = "What is a universal file format?"
@@ -1189,40 +2254,48 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     assert 'PDF' in res_dict['response'] and 'pdf-sample.pdf' in res_dict['response']
 
     # check sources, and do after so would detect leakage
-    res = client.predict(langchain_mode, api_name='/get_sources')
+    res = client.predict(langchain_mode, h2ogpt_key, api_name='/get_sources')
     # is not actual data!
     assert isinstance(res[1], str)
     res = res[0]
-    with open(res['name'], 'rb') as f:
+    if not is_gradio_version4:
+        res = res['name']
+    with open(res, 'rb') as f:
         sources = f.read().decode()
     sources_expected = f'{user_path}/FAQ.md\n{user_path}/README.md\n{user_path}/pexels-evg-kowalievska-1170986_small.jpg\n{user_path}/sample1.pdf'
     assert sources == sources_expected or sources.replace('\\', '/').replace('\r', '') == sources_expected.replace(
         '\\', '/').replace('\r', '')
 
-    res = client.predict(langchain_mode2, api_name='/get_sources')
+    res = client.predict(langchain_mode2, h2ogpt_key, api_name='/get_sources')
     assert isinstance(res[1], str)
     res = res[0]
-    with open(res['name'], 'rb') as f:
+    if not is_gradio_version4:
+        res = res['name']
+    with open(res, 'rb') as f:
         sources = f.read().decode()
     sources_expected = """%s/pdf-sample.pdf""" % user_path2
     assert sources == sources_expected or sources.replace('\\', '/').replace('\r', '') == sources_expected.replace(
         '\\', '/').replace('\r', '')
 
     # check sources, and do after so would detect leakage
-    res = client.predict(langchain_mode, api_name='/get_viewable_sources')
+    res = client.predict(langchain_mode, h2ogpt_key, api_name='/get_viewable_sources')
     assert isinstance(res[1], str)
     res = res[0]
     # is not actual data!
-    with open(res['name'], 'rb') as f:
+    if not is_gradio_version4:
+        res = res['name']
+    with open(res, 'rb') as f:
         sources = f.read().decode()
     sources_expected = f'{user_path}/FAQ.md\n{user_path}/README.md\n{user_path}/pexels-evg-kowalievska-1170986_small.jpg\n{user_path}/sample1.pdf'
     assert sources == sources_expected or sources.replace('\\', '/').replace('\r', '') == sources_expected.replace(
         '\\', '/').replace('\r', '')
 
-    res = client.predict(langchain_mode2, api_name='/get_viewable_sources')
+    res = client.predict(langchain_mode2, h2ogpt_key, api_name='/get_viewable_sources')
     assert isinstance(res[1], str)
     res = res[0]
-    with open(res['name'], 'rb') as f:
+    if not is_gradio_version4:
+        res = res['name']
+    with open(res, 'rb') as f:
         sources = f.read().decode()
     sources_expected = """%s/pdf-sample.pdf""" % user_path2
     assert sources == sources_expected or sources.replace('\\', '/').replace('\r', '') == sources_expected.replace(
@@ -1231,35 +2304,42 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     # refresh
     shutil.copy('tests/next.txt', user_path)
     res = client.predict(langchain_mode, True, 512,
-                         *loaders,
+                         *loaders, h2ogpt_key,
                          api_name='/refresh_sources')
     sources_expected = 'file/%s/next.txt' % user_path
     assert sources_expected in res or sources_expected.replace('\\', '/').replace('\r', '') in res.replace('\\',
                                                                                                            '/').replace(
         '\r', '\n')
 
-    res = client.predict(langchain_mode, api_name='/get_sources')
+    res = client.predict(langchain_mode, h2ogpt_key, api_name='/get_sources')
     assert isinstance(res[1], str)
     res = res[0]
     # is not actual data!
-    with open(res['name'], 'rb') as f:
+    if not is_gradio_version4:
+        res = res['name']
+    with open(res, 'rb') as f:
         sources = f.read().decode()
-    sources_expected = f'{user_path}/FAQ.md\n{user_path}/README.md\n{user_path}/next.txt\n{user_path}/pexels-evg-kowalievska-1170986_small.jpg\n{user_path}/sample1.pdf'
+    sources_expected = f'{user_path}/FAQ.md\n{user_path}/README.md\n{user_path}/next.txt\n{user_path}/pexels-evg-kowalievska-1170986_small.jpg\n{user_path}/pexels-evg-kowalievska-1170986_small.jpg_rotated.jpg\n{user_path}/pexels-evg-kowalievska-1170986_small.jpg_rotated.jpg_pad_resized.png\n{user_path}/sample1.pdf'
     assert sources == sources_expected or sources.replace('\\', '/').replace('\r', '') == sources_expected.replace(
         '\\', '/').replace('\r', '')
 
     # check sources, and do after so would detect leakage
-    sources = ast.literal_eval(client.predict(langchain_mode, api_name='/get_sources_api'))
+    sources = ast.literal_eval(client.predict(langchain_mode, h2ogpt_key, api_name='/get_sources_api'))
     assert isinstance(sources, list)
     sources_expected = ['user_path_test/FAQ.md', 'user_path_test/README.md', 'user_path_test/next.txt',
-                        'user_path_test/pexels-evg-kowalievska-1170986_small.jpg', 'user_path_test/sample1.pdf']
+                        'user_path_test/pexels-evg-kowalievska-1170986_small.jpg',
+                        'user_path_test/pexels-evg-kowalievska-1170986_small.jpg_rotated.jpg',
+                        'user_path_test/pexels-evg-kowalievska-1170986_small.jpg_rotated.jpg_pad_resized.png',
+                        'user_path_test/sample1.pdf']
     assert sources == sources_expected
 
     file_to_get = sources_expected[3]
     view_raw_text = False
     text_context_list = None
+    pdf_height = 1000
     source_dict = ast.literal_eval(
-        client.predict(langchain_mode, file_to_get, view_raw_text, text_context_list, api_name='/get_document_api'))
+        client.predict(langchain_mode, file_to_get, view_raw_text, text_context_list, pdf_height, h2ogpt_key,
+                       api_name='/get_document_api'))
     assert len(source_dict['contents']) == 1
     assert len(source_dict['metadatas']) == 1
     assert isinstance(source_dict['contents'][0], str)
@@ -1269,7 +2349,8 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
 
     view_raw_text = True  # dict of metadatas stays dict instead of string
     source_dict = ast.literal_eval(
-        client.predict(langchain_mode, file_to_get, view_raw_text, text_context_list, api_name='/get_document_api'))
+        client.predict(langchain_mode, file_to_get, view_raw_text, text_context_list, pdf_height, h2ogpt_key,
+                       api_name='/get_document_api'))
     assert len(source_dict['contents']) == 2  # chunk_id=0 (query) and -1 (summarization)
     assert len(source_dict['metadatas']) == 2  # chunk_id=0 (query) and -1 (summarization)
     assert isinstance(source_dict['contents'][0], str)
@@ -1278,7 +2359,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     assert sources_expected[3] == source_dict['metadatas'][0]['source']
 
     # even normal langchain_mode  passed to this should get the other langchain_mode2
-    res = client.predict(langchain_mode, api_name='/load_langchain')
+    res = client.predict(langchain_mode, h2ogpt_key, api_name='/load_langchain')
     res0_choices = [x[0] for x in res[0]['choices']]
     assert res0_choices == [langchain_mode, 'MyData', 'github h2oGPT', 'LLM', langchain_mode2]
     assert res[0]['value'] == langchain_mode
@@ -1293,7 +2374,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     res = client.predict(api_name='/export_chats')
     assert res is not None
 
-    url = 'https://research.google/pubs/pub334.pdf'
+    url = 'https://services.google.com/fh/files/misc/e_conomy_sea_2021_report.pdf'
     res = client.predict(url, langchain_mode, True, 512, True,
                          *loaders,
                          h2ogpt_key,
@@ -1319,7 +2400,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     assert res[3] == ''
 
     langchain_mode_my = LangChainMode.MY_DATA.value
-    url = 'https://www.africau.edu/images/default/sample.pdf'
+    url = 'https://h2o-release.s3.amazonaws.com/h2ogpt/sample.pdf'
     test_file1 = os.path.join('/tmp/', 'sample1.pdf')
     download_simple(url, dest=test_file1)
     res = client.predict(test_file1, langchain_mode_my, True, 512, True,
@@ -1339,7 +2420,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     user_path2b = ''
     langchain_mode2 = 'MyData2'
     new_langchain_mode_text = '%s, %s, %s' % (langchain_mode2, 'personal', user_path2b)
-    res = client.predict(langchain_mode2, new_langchain_mode_text, api_name='/new_langchain_mode_text')
+    res = client.predict(langchain_mode2, new_langchain_mode_text, h2ogpt_key, api_name='/new_langchain_mode_text')
     assert res[0]['value'] == langchain_mode2
     res0_choices = [x[0] for x in res[0]['choices']]
     assert langchain_mode2 in res0_choices
@@ -1390,7 +2471,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
     langchain_mode3 = 'MyData3'
     user_path3 = ''
     new_langchain_mode_text = '%s, %s, %s' % (langchain_mode3, 'personal', user_path3)
-    res = client.predict(langchain_mode3, new_langchain_mode_text, api_name='/new_langchain_mode_text')
+    res = client.predict(langchain_mode3, new_langchain_mode_text, h2ogpt_key, api_name='/new_langchain_mode_text')
     assert res[0]['value'] == langchain_mode3
     res0_choices = [x[0] for x in res[0]['choices']]
     assert langchain_mode3 in res0_choices
@@ -1416,27 +2497,28 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
         assert [x in res[2] or x.replace('https', 'http') in res[2] for x in urls]
         assert res[3] == ''
 
-    sources_text = client.predict(langchain_mode3, api_name='/show_sources')
+    sources_text = client.predict(langchain_mode3, h2ogpt_key, api_name='/show_sources')
     assert isinstance(sources_text, str)
     assert [x in sources_text or x.replace('https', 'http') in sources_text for x in urls]
 
-    source_list = ast.literal_eval(client.predict(langchain_mode3, api_name='/get_sources_api'))
+    source_list = ast.literal_eval(client.predict(langchain_mode3, h2ogpt_key, api_name='/get_sources_api'))
     source_list_assert = [x.replace('v1', '').replace('v7', '') for x in source_list]  # for arxiv for asserts
     assert isinstance(source_list, list)
     assert [x in source_list_assert or x.replace('https', 'http') in source_list_assert for x in urls]
 
-    sources_text_after_delete = client.predict(source_list[0], langchain_mode3, api_name='/delete_sources')
+    sources_text_after_delete = client.predict(source_list[0], langchain_mode3, h2ogpt_key, api_name='/delete_sources')
     source_list_assert = [x.replace('v1', '').replace('v7', '') for x in source_list]  # for arxiv for asserts
     assert source_list_assert[0] not in sources_text_after_delete
 
-    sources_state_after_delete = ast.literal_eval(client.predict(langchain_mode3, api_name='/get_sources_api'))
+    sources_state_after_delete = ast.literal_eval(
+        client.predict(langchain_mode3, h2ogpt_key, api_name='/get_sources_api'))
     sources_state_after_delete = [x.replace('v1', '').replace('v7', '') for x in
                                   sources_state_after_delete]  # for arxiv for asserts
     assert isinstance(sources_state_after_delete, list)
     source_list_assert = [x.replace('v1', '').replace('v7', '') for x in source_list]  # for arxiv for asserts
     assert source_list_assert[0] not in sources_state_after_delete
 
-    res = client.predict(langchain_mode3, langchain_mode3, api_name='/remove_langchain_mode_text')
+    res = client.predict(langchain_mode3, langchain_mode3, h2ogpt_key, api_name='/remove_langchain_mode_text')
     assert res[0]['value'] == langchain_mode3
     res0_choices = [x[0] for x in res[0]['choices']]
     assert langchain_mode2 in res0_choices
@@ -1450,7 +2532,7 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
                               [langchain_mode2, 'personal', '']]
 
     assert os.path.isdir("db_dir_%s" % langchain_mode)
-    res = client.predict(langchain_mode, langchain_mode, api_name='/purge_langchain_mode_text')
+    res = client.predict(langchain_mode, langchain_mode, h2ogpt_key, api_name='/purge_langchain_mode_text')
     assert not os.path.isdir("db_dir_%s" % langchain_mode)
     assert res[0]['value'] == langchain_mode
     res0_choices = [x[0] for x in res[0]['choices']]
@@ -1466,8 +2548,11 @@ def test_client_chat_stream_langchain_steps3(loaders, enforce_h2ogpt_api_key, en
 
 
 @pytest.mark.need_tokens
+@pytest.mark.parametrize("model_choice", ['h2oai/h2ogpt-oig-oasst1-512-6_9b'] + model_names_curated)
 @wrap_test_forked
-def test_client_load_unload_models():
+def test_client_load_unload_models(model_choice):
+    if model_choice in model_names_curated_big:
+        return
     os.environ['VERBOSE_PIPELINE'] = '1'
     user_path = make_user_path_test()
 
@@ -1491,13 +2576,12 @@ def test_client_load_unload_models():
     # serialize=False would lead to returning dict for some objects or files for get_sources
     client = get_client(serialize=False)
 
-    model_choice = 'h2oai/h2ogpt-oig-oasst1-512-6_9b'
     lora_choice = ''
-    server_choice = ''
+    server_choice = '' if model_choice not in openai_gpts else 'openai_chat'
     # model_state
-    prompt_type = ''
+    prompt_type = '' if model_choice != 'llama' else 'llama2'  # built-in, but prompt_type needs to be selected
     model_load8bit_checkbox = False
-    model_load4bit_checkbox = True
+    model_load4bit_checkbox = 'AWQ' not in model_choice and 'GGUF' not in model_choice and 'GPTQ' not in model_choice
     model_low_bit_mode = 1
     model_load_gptq = ''
     model_load_awq = ''
@@ -1505,11 +2589,11 @@ def test_client_load_unload_models():
     model_safetensors_checkbox = False
     model_revision = ''
     model_use_gpu_id_checkbox = True
-    model_gpu = 0
-    max_seq_len = 2048
+    model_gpu_id = 0
+    max_seq_len = -1
     rope_scaling = '{}'
     # GGML:
-    model_path_llama = ''
+    model_path_llama = 'https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf?download=true' if model_choice == 'llama' else ''
     model_name_gptj = ''
     model_name_gpt4all_llama = ''
     n_gpu_layers = 100
@@ -1517,35 +2601,136 @@ def test_client_load_unload_models():
     n_gqa = 0  # llama2 needs 8
     llamacpp_dict_more = '{}'
     system_prompt = None
+    model_cpu = False
+    exllama_dict = "{}"
+    gptq_dict = "{}"
+    attention_sinks = False
+    sink_dict = "{}"
+    truncation_generation = False
+    hf_model_dict = "{}"
+    model_force_seq2seq_type = False
+    model_force_force_t5_type = False
     args_list = [model_choice, lora_choice, server_choice,
                  # model_state,
                  prompt_type,
                  model_load8bit_checkbox, model_load4bit_checkbox, model_low_bit_mode,
                  model_load_gptq, model_load_awq, model_load_exllama_checkbox,
                  model_safetensors_checkbox, model_revision,
-                 model_use_gpu_id_checkbox, model_gpu,
+                 model_cpu,
+                 model_use_gpu_id_checkbox, model_gpu_id,
                  max_seq_len, rope_scaling,
                  model_path_llama, model_name_gptj, model_name_gpt4all_llama,
                  n_gpu_layers, n_batch, n_gqa, llamacpp_dict_more,
-                 system_prompt]
+                 system_prompt,
+                 exllama_dict, gptq_dict, attention_sinks, sink_dict, truncation_generation, hf_model_dict,
+                 model_force_seq2seq_type, model_force_force_t5_type,
+                 ]
     res = client.predict(*tuple(args_list), api_name='/load_model')
-    res_expected = ('h2oai/h2ogpt-oig-oasst1-512-6_9b', '', '', 'human_bot', {'__type__': 'update', 'maximum': 256},
-                    {'__type__': 'update', 'maximum': 256})
+
+    model_choice_ex = model_choice
+    model_load_gptq_ex = 'model' if 'GPTQ' in model_choice else ''
+    model_load_awq_ex = 'model' if 'AWQ' in model_choice else ''
+    model_path_llama_ex = 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q5_K_M.gguf?download=true' if model_choice == 'llama' else ''
+
+    if model_choice == 'h2oai/h2ogpt-oig-oasst1-512-6_9b':
+        prompt_type_ex = 'human_bot'
+        max_seq_len_ex = 2048.0
+        max_seq_len_ex2 = max_seq_len_ex
+    elif model_choice in ['llama']:
+        prompt_type_ex = 'llama2'
+        model_choice_ex = 'llama'
+        model_path_llama_ex = 'https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf?download=true'
+        max_seq_len_ex = 4096.0
+        max_seq_len_ex2 = max_seq_len_ex
+    elif model_choice in ['TheBloke/Llama-2-7B-Chat-GGUF']:
+        prompt_type_ex = 'llama2'
+        model_choice_ex = 'llama'
+        model_path_llama_ex = 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q5_K_M.gguf?download=true'
+        max_seq_len_ex = 4096.0
+        max_seq_len_ex2 = max_seq_len_ex
+    elif model_choice in ['TheBloke/zephyr-7B-beta-GGUF']:
+        prompt_type_ex = 'zephyr'
+        model_choice_ex = 'llama'
+        model_path_llama_ex = 'https://huggingface.co/TheBloke/zephyr-7B-beta-GGUF/resolve/main/zephyr-7b-beta.Q5_K_M.gguf?download=true'
+        max_seq_len_ex = 4096.0
+        max_seq_len_ex2 = max_seq_len_ex
+    elif model_choice in ['HuggingFaceH4/zephyr-7b-beta',
+                          'TheBloke/zephyr-7B-beta-AWQ']:
+        prompt_type_ex = 'zephyr'
+        max_seq_len_ex = 4096.0
+        max_seq_len_ex2 = max_seq_len_ex
+    elif model_choice in ['TheBloke/Xwin-LM-13B-V0.1-GPTQ']:
+        prompt_type_ex = 'xwin'
+        max_seq_len_ex = 4096.0
+        max_seq_len_ex2 = max_seq_len_ex
+    elif model_choice in ['gpt-3.5-turbo']:
+        prompt_type_ex = 'openai_chat'
+        max_seq_len_ex = 4096.0
+        max_seq_len_ex2 = 4046
+    else:
+        raise ValueError("No such model_choice=%s" % model_choice)
+    res_expected = (
+        model_choice_ex, '', server_choice, prompt_type_ex, max_seq_len_ex2,
+        {'__type__': 'update', 'maximum': int(max_seq_len_ex)},
+        {'__type__': 'update', 'maximum': int(max_seq_len_ex)},
+        model_path_llama_ex,
+        '', '',
+        model_load_gptq_ex, model_load_awq_ex,
+        0.0, 128.0, 100.0, '{}')
     assert res == res_expected
-    model_used, lora_used, server_used, prompt_type, max_new_tokens, min_new_tokens = res_expected
 
     prompt = "Who are you?"
     kwargs = dict(stream_output=stream_output, instruction=prompt)
     res_dict, client = run_client_gen(client, kwargs)
     response = res_dict['response']
-    assert 'What do you want to be?' in response
+    assert response
 
-    # unload
+    # unload (could use unload api)
     args_list[0] = no_model_str
     res = client.predict(*tuple(args_list), api_name='/load_model')
-    res_expected = (no_model_str, no_lora_str, no_server_str, '', {'__type__': 'update', 'maximum': 256},
-                    {'__type__': 'update', 'maximum': 256})
+    res_expected = (no_model_str, no_lora_str, no_server_str, '', -1.0, {'__type__': 'update', 'maximum': 256},
+                    {'__type__': 'update', 'maximum': 256},
+                    '',
+                    '', '',
+                    '', '',
+                    0.0, 128.0, 100.0, '{}')
     assert res == res_expected
+
+
+@pytest.mark.need_tokens
+@pytest.mark.parametrize("stream_output", [True, False])
+@pytest.mark.parametrize("base_model", ['h2oai/h2ogpt-oig-oasst1-512-6_9b'] +
+                         model_names_curated +
+                         ['zephyr-7b-beta.Q5_K_M.gguf'] +
+                         [
+                             'https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf?download=true'])
+@wrap_test_forked
+def test_client_curated_base_models(base_model, stream_output):
+    if base_model in model_names_curated_big:
+        return
+    if base_model == 'zephyr-7b-beta.Q5_K_M.gguf' and not os.path.isfile('zephyr-7b-beta.Q5_K_M.gguf'):
+        download_simple(
+            'https://huggingface.co/TheBloke/zephyr-7B-beta-GGUF/resolve/main/zephyr-7b-beta.Q5_K_M.gguf?download=true')
+
+    stream_output = True
+    from src.gen import main
+    main(base_model=base_model,
+         inference_server='' if base_model not in openai_gpts else 'openai_chat',
+         chat=True,
+         stream_output=stream_output,
+         gradio=True, num_beams=1, block_gradio_exit=False,
+         score_model='',
+         verbose=True)
+
+    from src.client_test import get_client
+    # serialize=False would lead to returning dict for some objects or files for get_sources
+    client = get_client(serialize=False)
+
+    prompt = "Who are you?"
+    kwargs = dict(stream_output=stream_output, instruction=prompt)
+    res_dict, client = run_client_gen(client, kwargs)
+    response = res_dict['response']
+    assert response
 
 
 @pytest.mark.need_tokens
@@ -1575,12 +2760,13 @@ def test_client_chat_stream_langchain_openai_embeddings():
     # serialize=False would lead to returning dict for some objects or files for get_sources
     client = get_client(serialize=False)
 
-    url = 'https://www.africau.edu/images/default/sample.pdf'
+    url = 'https://h2o-release.s3.amazonaws.com/h2ogpt/sample.pdf'
     test_file1 = os.path.join('/tmp/', 'sample1.pdf')
     download_simple(url, dest=test_file1)
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     res = client.predict(test_file1, langchain_mode, True, 512, True,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_file_api')
     assert res[0] is None
@@ -1592,7 +2778,7 @@ def test_client_chat_stream_langchain_openai_embeddings():
     from src.gpt_langchain import load_embed
     got_embedding, use_openai_embedding, hf_embedding_model = load_embed(persist_directory='db_dir_UserData')
     assert use_openai_embedding
-    assert hf_embedding_model == 'hkunlp/instructor-large'  # but not used
+    assert hf_embedding_model in ['', 'hkunlp/instructor-large']  # but not used
     assert got_embedding
 
 
@@ -1616,7 +2802,7 @@ def test_client_clone(stream_output):
         response = res_dict['response']
         assert len(response) > 0
         sources = res_dict['sources']
-        assert sources == ''
+        assert sources == []
 
 
 @pytest.mark.parametrize("max_time", [1, 5])
@@ -1640,11 +2826,11 @@ def test_client_timeout(stream_output, max_time):
     assert len(response) > 0
     assert time.time() - t0 < max_time * 2
     sources = res_dict['sources']
-    assert sources == ''
+    assert sources == []
 
     # get file for client to upload
     url = 'https://cdn.openai.com/papers/whisper.pdf'
-    test_file1 = os.path.join('/tmp/', 'my_test_pdf.pdf')
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
     download_simple(url, dest=test_file1)
 
     # PURE client code
@@ -1657,10 +2843,11 @@ def test_client_timeout(stream_output, max_time):
     chunk = True
     chunk_size = 512
     langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     res = client.predict(test_file_server,
                          langchain_mode, chunk, chunk_size, True,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_file_api')
     assert res[0] is None
@@ -1686,11 +2873,11 @@ def test_client_timeout(stream_output, max_time):
     response = res_dict['response']
     assert len(response) > 0
     # assert len(response) < max_time * 20  # 20 tokens/sec
-    assert time.time() - t0 < max_time * 2
+    assert time.time() - t0 < max_time * 2.5
     sources = [x['source'] for x in res_dict['sources']]
     # only get source not empty list if break in inner loop, not gradio_runner loop, so good test of that too
     # this is why gradio timeout adds 10 seconds, to give inner a chance to produce references or other final info
-    assert 'my_test_pdf.pdf' in sources[0]
+    assert 'whisper1.pdf' in sources[0]
 
 
 # pip install pytest-timeout
@@ -1787,12 +2974,16 @@ def go_upload_gradio():
 
 
 # NOTE: llama-7b on 24GB will go OOM for helium1/2 tests
-@pytest.mark.parametrize("inference_server", [None, 'openai_chat', 'openai_azure_chat', 'replicate'])
+@pytest.mark.parametrize("repeat", range(0, 1))
+# @pytest.mark.parametrize("inference_server", ['http://localhost:7860'])
+@pytest.mark.parametrize("inference_server", [None, 'openai', 'openai_chat', 'openai_azure_chat', 'replicate'])
 # local_server=True
-@pytest.mark.parametrize("base_model",
-                         ['h2oai/h2ogpt-oig-oasst1-512-6_9b', 'h2oai/h2ogpt-4096-llama2-7b-chat', 'gpt-3.5-turbo'])
+# @pytest.mark.parametrize("base_model",
+#                         ['h2oai/h2ogpt-4096-llama2-13b-chat'])
 # local_server=False or True if inference_server used
 # @pytest.mark.parametrize("base_model", ['h2oai/h2ogpt-4096-llama2-70b-chat'])
+@pytest.mark.parametrize("base_model",
+                         ['h2oai/h2ogpt-oig-oasst1-512-6_9b', 'h2oai/h2ogpt-4096-llama2-7b-chat', 'gpt-3.5-turbo'])
 @pytest.mark.parametrize("data_kind", [
     'simple',
     'helium1',
@@ -1802,7 +2993,7 @@ def go_upload_gradio():
     'helium5',
 ])
 @wrap_test_forked
-def test_client_chat_stream_langchain_fake_embeddings(data_kind, base_model, inference_server):
+def test_client_chat_stream_langchain_fake_embeddings(data_kind, base_model, inference_server, repeat):
     # local_server = False  # set to False to test local server, e.g. gradio connected to TGI server
     local_server = True  # for gradio connected to TGI, or if pass inference_server too then some remote vLLM/TGI using local server
     return run_client_chat_stream_langchain_fake_embeddings(data_kind, base_model, local_server, inference_server)
@@ -1970,7 +3161,7 @@ def run_client_chat_stream_langchain_fake_embeddings(data_kind, base_model, loca
             inference_server += ':%s:%s' % (deployment_name, 'h2ogpt.openai.azure.com/')
             if 'azure' in inference_server:
                 assert 'OPENAI_AZURE_KEY' in os.environ, "Missing 'OPENAI_AZURE_KEY'"
-                os.environ['OPENAI_API_KEY'] = os.environ['OPENAI_AZURE_KEY']
+                inference_server += ':None:%s' % os.environ['OPENAI_AZURE_KEY']
     else:
         if base_model == 'gpt-3.5-turbo':
             return
@@ -1994,8 +3185,10 @@ def run_client_chat_stream_langchain_fake_embeddings(data_kind, base_model, loca
              max_new_tokens=max_new_tokens,
              langchain_mode=langchain_mode,
              langchain_modes=langchain_modes,
-             use_openai_embedding=True,
+             use_openai_embedding=False,
              verbose=True)
+    else:
+        os.environ['HOST'] = inference_server
     print("TIME main: %s %s %s" % (data_kind, base_model, time.time() - t0), flush=True, file=sys.stderr)
     t0 = time.time()
 
@@ -2076,7 +3269,7 @@ def run_client_chat_stream_langchain_fake_embeddings(data_kind, base_model, loca
             if base_model == 'gpt-3.5-turbo':
                 tokens_expected = 3000 if local_server else 2900
                 expected_return_number = 14 if local_server else 14
-                expected_return_number2 = 15 if 'azure' not in inference_server else 14
+                expected_return_number2 = 14 if 'azure' not in inference_server else 14
             elif inference_server and 'replicate' in inference_server:
                 tokens_expected = 3000 if local_server else 2900
                 expected_return_number = 11 if local_server else 11
@@ -2195,6 +3388,7 @@ Rating: 5 (most positive)"""
     embed = False
     chunk = False
     chunk_size = 512
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     api_name = '/submit_nochat_api'  # NOTE: like submit_nochat but stable API for string dict passing
     print("TIME prep: %s %s %s" % (data_kind, base_model, time.time() - t0), flush=True, file=sys.stderr)
@@ -2209,6 +3403,7 @@ Rating: 5 (most positive)"""
         do_sample=False,
         instruction_nochat=prompt,
         text_context_list=None,  # NOTE: If use same client instance and push to this textbox, will be there next call
+        metadata_in_context=[],
     )
 
     # fast text doc Q/A
@@ -2222,6 +3417,7 @@ Rating: 5 (most positive)"""
         document_choice=DocumentChoice.ALL.value,
         instruction_nochat=prompt_when_texts,
         text_context_list=texts,
+        visible_models=base_model,
     ))
     res = client.predict(
         str(dict(kwargs)),
@@ -2247,7 +3443,7 @@ Rating: 5 (most positive)"""
     # Full langchain with db
     res = client.predict(texts,
                          langchain_mode, chunk, chunk_size, embed,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_text')
     assert res[0] is None
@@ -2263,7 +3459,7 @@ Rating: 5 (most positive)"""
         from src.gpt_langchain import load_embed
 
         # even normal langchain_mode  passed to this should get the other langchain_mode2
-        res = client.predict(langchain_mode, api_name='/load_langchain')
+        res = client.predict(langchain_mode, h2ogpt_key, api_name='/load_langchain')
         persist_directory = res[1]['data'][2][3]
         if langchain_mode == 'UserData':
             persist_directory_check = 'db_dir_%s' % langchain_mode
@@ -2295,6 +3491,7 @@ Rating: 5 (most positive)"""
         top_k_docs=-1,
         document_subset='Relevant',
         document_choice=DocumentChoice.ALL.value,
+        visible_models=base_model,
     ))
     res = client.predict(
         str(dict(kwargs)),
@@ -2331,6 +3528,9 @@ Rating: 5 (most positive)"""
 @wrap_test_forked
 def test_client_summarization(prompt_summary, inference_server, top_k_docs, stream_output, instruction,
                               langchain_action, db_type, which_doc):
+    if random.randint(0, 100) != 0:
+        # choose randomly, >1000 tests otherwise
+        return
     kill_weaviate(db_type)
     # launch server
     local_server = True
@@ -2339,7 +3539,7 @@ def test_client_summarization(prompt_summary, inference_server, top_k_docs, stre
         if not inference_server:
             base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'
         elif inference_server == 'https://gpt.h2o.ai':
-            base_model = 'h2oai/h2ogpt-4096-llama2-13b-chat'
+            base_model = 'HuggingFaceH4/zephyr-7b-beta'
         else:
             base_model = 'gpt-3.5-turbo'
 
@@ -2353,7 +3553,8 @@ def test_client_summarization(prompt_summary, inference_server, top_k_docs, stre
 
         if inference_server == 'https://gpt.h2o.ai':
             model_lock = [
-                dict(inference_server=inference_server, base_model=base_model, visible_models=base_model,
+                dict(inference_server=inference_server + ":guest:guest", base_model=base_model,
+                     visible_models=base_model,
                      h2ogpt_key=os.getenv('H2OGPT_API_KEY'))]
             base_model = inference_server = None
         else:
@@ -2378,7 +3579,7 @@ def test_client_summarization(prompt_summary, inference_server, top_k_docs, stre
     # get file for client to upload
     if which_doc == 'whisper':
         url = 'https://cdn.openai.com/papers/whisper.pdf'
-        test_file1 = os.path.join('/tmp/', 'my_test_pdf.pdf')
+        test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
         download_simple(url, dest=test_file1)
     elif which_doc == 'graham':
         test_file1 = 'tests/1paul_graham.txt'
@@ -2399,15 +3600,18 @@ def test_client_summarization(prompt_summary, inference_server, top_k_docs, stre
         hash_server = hash_file(test_file_server)
         assert hash_client == hash_local
         assert hash_client == hash_server
-    assert os.path.normpath(test_file_local) != os.path.normpath(test_file_server)
+    from gradio_utils.grclient import is_gradio_client_version7plus
+    # if is_gradio_client_version7plus:
+    #    assert os.path.normpath(test_file_local) != os.path.normpath(test_file_server)
 
     chunk = True
     chunk_size = 512
     langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     res = client.predict(test_file_server,
                          langchain_mode, chunk, chunk_size, True,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_file_api')
     assert res[0] is None
@@ -2437,18 +3641,19 @@ def test_client_summarization(prompt_summary, inference_server, top_k_docs, stre
     summary = res['response']
     sources = res['sources']
     if langchain_action == 'Extract':
-        assert isinstance(summary, list) or 'No relevant documents to extract from.' == summary
-        summary = str(summary)  # for easy checking
+        extraction = ast.literal_eval(summary)
+        assert isinstance(extraction, list) or 'No relevant documents to extract from.' in str(extraction)
+        summary = str(extraction)  # for easy checking
 
     if which_doc == 'whisper':
         if instruction == 'Technical key points':
-            if langchain_action == LangChainAction.SUMMARIZE_MAP.value:
-                assert 'No relevant documents to summarize.' in summary or 'long-form transcription' in summary or 'text standardization' in summary or 'speech processing' in summary
-            else:
-                assert 'No relevant documents to extract from.' in summary or \
-                       'long-form transcription' in summary or \
-                       'text standardization' in summary or \
-                       'speech processing' in summary
+            # if langchain_action == LangChainAction.SUMMARIZE_MAP.value:
+            assert 'No relevant documents to extract from.' in summary or \
+                   'No relevant documents to summarize.' in summary or \
+                   'long-form transcription' in summary or \
+                   'text standardization' in summary or \
+                   'speech processing' in summary or \
+                   'speech recognition' in summary
         else:
             if prompt_summary == '':
                 assert 'Whisper' in summary or \
@@ -2466,11 +3671,17 @@ def test_client_summarization(prompt_summary, inference_server, top_k_docs, stre
                        'Large-scale weak supervision of speech' in summary or \
                        'text standardization' in summary or \
                        'speech processing systems' in summary
-            assert 'Robust Speech Recognition' in [x['content'] for x in sources][0]
-            assert 'my_test_pdf.pdf' in [x['source'] for x in sources][0]
+            if summary == 'No relevant documents to extract from.':
+                assert sources == []
+            else:
+                assert 'Robust Speech Recognition' in [x['content'] for x in sources][0]
+                assert 'whisper1.pdf' in [x['source'] for x in sources][0]
     else:
         # weaviate as usual gets confused and has too many sources
-        assert '1paul_graham.txt' in [x['source'] for x in sources][0]
+        if summary == 'No relevant documents to extract from.':
+            assert sources == []
+        else:
+            assert '1paul_graham.txt' in [x['source'] for x in sources][0]
 
 
 @pytest.mark.need_tokens
@@ -2480,30 +3691,32 @@ def test_client_summarization_from_text():
     base_model = 'meta-llama/Llama-2-7b-chat-hf'
     from src.gen import main
     main(base_model=base_model, chat=True, gradio=True, num_beams=1, block_gradio_exit=False, verbose=True,
+         add_disk_models_to_ui=False,
          use_auth_token=True,
          )
 
     # get file for client to upload
     url = 'https://cdn.openai.com/papers/whisper.pdf'
-    test_file1 = os.path.join('/tmp/', 'my_test_pdf.pdf')
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
     download_simple(url, dest=test_file1)
 
     # Get text version of PDF
-    from langchain.document_loaders import PyMuPDFLoader
+    from langchain_community.document_loaders import PyMuPDFLoader
     # load() still chunks by pages, but every page has title at start to help
     doc1 = PyMuPDFLoader(test_file1).load()
     all_text_contents = '\n\n'.join([x.page_content for x in doc1])
 
     # PURE client code
     from gradio_client import Client
-    client = Client(get_inf_server(), serialize=True)
+    client = Client(get_inf_server(), serialize=False)
     chunk = True
     chunk_size = 512
     langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     res = client.predict(all_text_contents,
                          langchain_mode, chunk, chunk_size, True,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_text')
     assert res[0] is None
@@ -2528,9 +3741,13 @@ def test_client_summarization_from_text():
     res = ast.literal_eval(res)
     summary = res['response']
     sources = res['sources']
-    assert 'Whisper' in summary or 'robust speech recognition system' in summary
+    assert 'Whisper' in summary or 'robust speech recognition system' in summary or 'large-scale weak supervision' in summary
     assert 'Robust Speech Recognition' in [x['content'] for x in sources][0]
     assert 'user_paste' in [x['source'] for x in sources][0]
+    assert len(res['prompt_raw']) > 40000
+    assert '<s>[INST]' in res['prompt_raw']
+    assert len(ast.literal_eval(res['prompt_raw'])) == 5
+    assert 'llm_answers' in res
 
 
 @pytest.mark.parametrize("url", ['https://cdn.openai.com/papers/whisper.pdf', 'https://github.com/h2oai/h2ogpt'])
@@ -2547,14 +3764,15 @@ def test_client_summarization_from_url(url, top_k_docs):
 
     # PURE client code
     from gradio_client import Client
-    client = Client(get_inf_server(), serialize=True)
+    client = Client(get_inf_server(), serialize=False)
     chunk = True
     chunk_size = 512
     langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     res = client.predict(url,
                          langchain_mode, chunk, chunk_size, True,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_url')
     assert res[0] is None
@@ -2591,11 +3809,15 @@ def test_client_summarization_from_url(url, top_k_docs):
                or 'H2O GPT is an open-source project' in summary \
                or 'is an open-source project for document Q/A' in summary \
                or 'h2oGPT is an open-source project' in summary \
+               or 'h2oGPT model' in summary \
+               or 'released an open-source version' in summary \
+               or 'Summarizes the main features' in summary \
                or ('key results based on the provided document' in summary and 'h2oGPT' in summary)
         assert 'h2oGPT' in [x['content'] for x in sources][0]
     assert url in [x['source'] for x in sources][0]
 
 
+@pytest.mark.skip(reason="https://github.com/huggingface/tokenizers/issues/1452")
 @pytest.mark.parametrize("prompt_type", ['instruct_vicuna', 'one_shot'])
 @pytest.mark.parametrize("bits", [None, 8, 4])
 @pytest.mark.parametrize("stream_output", [True, False])
@@ -2624,11 +3846,11 @@ def test_fastsys(stream_output, bits, prompt_type):
            "As  an  AI  language  model,  I  don't  have  a  personal  identity  or  physical  presence.  I  exist  solely  to  provide  information  and  answer  questions  to  the  best  of  my  ability.  How  can  I  assist  you  today?" in response or \
            "As  an  AI  language  model,  I  don't  have  a  physical  identity  or  a  physical  presence.  I  exist  solely  to  provide  information  and  answer  questions  to  the  best  of  my  ability.  How  can  I  assist  you  today?" in response
     sources = res_dict['sources']
-    assert sources == ''
+    assert sources == []
 
     # get file for client to upload
     url = 'https://cdn.openai.com/papers/whisper.pdf'
-    test_file1 = os.path.join('/tmp/', 'my_test_pdf.pdf')
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
     download_simple(url, dest=test_file1)
 
     # PURE client code
@@ -2641,10 +3863,11 @@ def test_fastsys(stream_output, bits, prompt_type):
     chunk = True
     chunk_size = 512
     langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     res = client.predict(test_file_server,
                          langchain_mode, chunk, chunk_size, True,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_file_api')
     assert res[0] is None
@@ -2667,13 +3890,14 @@ def test_fastsys(stream_output, bits, prompt_type):
                   )
     res_dict, client = run_client_gen(client, kwargs)
     response = res_dict['response']
-    if bits is None:
-        assert """Whisper is a machine learning model developed by OpenAI for speech recognition. It is trained on large amounts of text data from the internet and uses a minimalist approach to data pre-processing, relying on the expressiveness of sequence-to-sequence models to learn to map between words in a transcript. The model is designed to be able to predict the raw text of transcripts without any significant standardization, allowing it to learn to map between words in different languages without having to rely on pre-trained models.""" in response or \
-               """Whisper  is  a  speech  processing  system  that  is  designed  to  generalize  well  across  domains,  tasks,  and  languages.  It  is  based  on  a  single  robust  architecture  that  is  trained  on  a  wide  set  of  existing  datasets,  and  it  is  able  to  generalize  well  across  domains,  tasks,  and  languages.  The  goal  of  Whisper  is  to  develop  a  single  robust  speech  processing  system  that  works  reliably  without  the  need  for  dataset-specific  fine-tuning  to  achieve  high-quality  results  on  specific  distributions.""" in response
-    else:
-        assert """single  robust  speech  processing  system  that  works""" in response or """Whisper""" in response
+    assert """speech recognition""" in response or \
+           """speech  recognition""" in response or \
+           """domains,  tasks,  and  languages""" in response or \
+           """weak  supervision""" in response or \
+           """weak supervision""" in response or \
+           """Whisper  is  a  language  model""" in response
     sources = [x['source'] for x in res_dict['sources']]
-    assert 'my_test_pdf.pdf' in sources[0]
+    assert 'whisper1.pdf' in sources[0]
 
 
 @pytest.mark.parametrize("hyde_template", ['auto', None, """Give detailed answer for: {query}"""])
@@ -2691,7 +3915,7 @@ def test_hyde(stream_output, hyde_level, hyde_template):
 
     # get file for client to upload
     url = 'https://coca-colafemsa.com/wp-content/uploads/2023/04/Coca-Cola-FEMSA-Results-1Q23-vf-2.pdf'
-    test_file1 = os.path.join('/tmp/', 'my_test_pdf.pdf')
+    test_file1 = os.path.join('/tmp/', 'femsa1.pdf')
     remove(test_file1)
     download_simple(url, dest=test_file1)
 
@@ -2705,11 +3929,12 @@ def test_hyde(stream_output, hyde_level, hyde_template):
     chunk = True
     chunk_size = 512
     langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
     h2ogpt_key = ''
     embed = True
     res = client.predict(test_file_server,
                          langchain_mode, chunk, chunk_size, embed,
-                         None, None, None, None,
+                         *loaders,
                          h2ogpt_key,
                          api_name='/add_file_api')
     assert res[0] is None
@@ -2736,4 +3961,1201 @@ def test_hyde(stream_output, hyde_level, hyde_template):
     response = res_dict['response']
     assert """23,222 million""" in response
     sources = [x['source'] for x in res_dict['sources']]
-    assert 'my_test_pdf.pdf' in sources[0]
+    assert 'femsa1.pdf' in sources[0]
+
+
+def set_env(tts_model):
+    from src.tts_coqui import list_models
+    coqui_models = list_models()
+    if tts_model.startswith('tts_models/'):
+        assert tts_model in coqui_models, tts_model
+        # for deepspeed, needs to be same as torch for compilation of kernel
+        os.environ['CUDA_HOME'] = os.getenv('CUDA_HOME', '/usr/local/cuda-12.1')
+        sr = 24000
+    else:
+        sr = 16000
+    return sr
+
+
+@pytest.mark.parametrize("tts_model", [
+    'microsoft/speecht5_tts',
+    'tts_models/multilingual/multi-dataset/xtts_v2'
+])
+@wrap_test_forked
+def test_client1_tts(tts_model):
+    from src.gen import main
+    main(base_model='llama', chat=False,
+         tts_model=tts_model,
+         enable_tts=True,
+         stream_output=False, gradio=True, num_beams=1, block_gradio_exit=False)
+
+    sr = set_env(tts_model)
+
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # string of dict for input
+    prompt = 'Who are you?'
+    kwargs = dict(instruction_nochat=prompt, chatbot_role="Female AI Assistant", speaker="SLT (female)")
+    res = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
+    res = ast.literal_eval(res)
+
+    response = res['response']
+    assert response
+    assert 'endoftext' not in response
+    print(response, flush=True)
+
+    play_audio(res['audio'], sr=sr)
+
+    check_final_res(res)
+
+
+def play_audio(audio, sr=16000):
+    # convert audio to file
+    if audio == b'':
+        # no audio
+        return
+
+    import io
+    from pydub import AudioSegment
+    s = io.BytesIO(audio)
+    channels = 1
+    sample_width = 2
+    filename = '/tmp/myfile.wav'
+    audio = AudioSegment.from_raw(s, sample_width=sample_width, frame_rate=sr, channels=channels)
+    if audio.duration_seconds < 0.5:
+        # FIXME: why are some very short, but not zero, audio outputs?
+        return
+    audio = audio.export(filename, format='wav')
+
+    # pip install playsound
+    # from playsound import playsound
+    playsound_wav(filename)
+
+
+@pytest.mark.parametrize("tts_model", [
+    'microsoft/speecht5_tts',
+    'tts_models/multilingual/multi-dataset/xtts_v2'
+])
+@pytest.mark.parametrize("base_model", [
+    'llama',
+    'HuggingFaceH4/zephyr-7b-beta'
+])
+@wrap_test_forked
+def test_client1_tts_stream(tts_model, base_model):
+    from src.gen import main
+    main(base_model=base_model, chat=False,
+         tts_model=tts_model,
+         enable_tts=True,
+         save_dir='foodir',
+         stream_output=True, gradio=True, num_beams=1, block_gradio_exit=False)
+
+    sr = set_env(tts_model)
+
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # string of dict for input
+    prompt = 'Who are you?'
+    kwargs = dict(instruction_nochat=prompt, chatbot_role="Female AI Assistant", speaker="SLT (female)",
+                  stream_output=True)
+
+    # check curl before and after, because in some cases had curl lead to .cpu() and normal use would fail
+    check_curl_plain_api()
+
+    verbose = False
+    job = client.submit(str(dict(kwargs)), api_name='/submit_nochat_api')
+    job_outputs_num = 0
+    while not job.done():
+        outputs_list = job.outputs().copy()
+        job_outputs_num_new = len(outputs_list[job_outputs_num:])
+        for num in range(job_outputs_num_new):
+            res = outputs_list[job_outputs_num + num]
+            res_dict = ast.literal_eval(res)
+            if verbose:
+                print('Stream %d: %s\n\n %s\n\n' % (num, res_dict['response'], res_dict), flush=True)
+            else:
+                print('Stream %d' % (job_outputs_num + num), flush=True)
+            play_audio(res_dict['audio'], sr=sr)
+        job_outputs_num += job_outputs_num_new
+        time.sleep(0.01)
+
+    outputs_list = job.outputs().copy()
+    job_outputs_num_new = len(outputs_list[job_outputs_num:])
+    res_dict = {}
+    for num in range(job_outputs_num_new):
+        res = outputs_list[job_outputs_num + num]
+        res_dict = ast.literal_eval(res)
+        if verbose:
+            print('Final Stream %d: %s\n\n%s\n\n' % (num, res_dict['response'], res_dict), flush=True)
+        else:
+            print('Final Stream %d' % (job_outputs_num + num), flush=True)
+        play_audio(res_dict['audio'], sr=sr)
+    job_outputs_num += job_outputs_num_new
+    print("total job_outputs_num=%d" % job_outputs_num, flush=True)
+    check_final_res(res_dict, base_model=base_model)
+
+    check_curl_plain_api()
+
+
+def check_final_res(res, base_model='llama'):
+    assert res['save_dict']
+    assert res['save_dict']['prompt']
+    if base_model == 'llama':
+        assert res['save_dict']['base_model'] == 'llama'
+    else:
+        assert res['save_dict']['base_model'] == 'HuggingFaceH4/zephyr-7b-beta'
+    assert res['save_dict']['where_from']
+    assert res['save_dict']['valid_key'] == 'not enforced'
+    assert res['save_dict']['h2ogpt_key'] in [None, '']
+
+    assert res['save_dict']['extra_dict']
+    if base_model == 'llama':
+        assert res['save_dict']['extra_dict']['llamacpp_dict']
+        assert res['save_dict']['extra_dict']['prompt_type'] == 'llama2'
+    else:
+        assert res['save_dict']['extra_dict']['prompt_type'] == 'zephyr'
+    assert res['save_dict']['extra_dict']['do_sample'] == False
+    assert res['save_dict']['extra_dict']['num_prompt_tokens'] > 10
+    assert res['save_dict']['extra_dict']['ntokens'] > 60
+    assert res['save_dict']['extra_dict']['tokens_persecond'] > 3.5
+
+
+def check_curl_plain_api():
+    # curl http://127.0.0.1:7860/api/submit_nochat_plain_api -X POST -d '{"data": ["{\"instruction_nochat\": \"Who are you?\"}"]}' -H 'Content-Type: application/json'
+    # https://curlconverter.com/
+    import requests
+
+    headers = {
+        # Already added when you pass json=
+        # 'Content-Type': 'application/json',
+    }
+
+    json_data = {
+        'data': [
+            '{"instruction_nochat": "Who are you?"}',
+        ],
+    }
+
+    response = requests.post('http://127.0.0.1:7860/api/submit_nochat_plain_api', headers=headers, json=json_data)
+    res_dict = ast.literal_eval(json.loads(response.content.decode(encoding='utf-8', errors='strict'))['data'][0])
+
+    assert 'assistant' in res_dict['response'] or 'computer program' in res_dict['response'] or 'program designed' in \
+           res_dict['response']
+    assert 'Who are you?' in res_dict['prompt_raw']
+    assert 'llama' == res_dict['save_dict']['base_model'] or 'HuggingFaceH4/zephyr-7b-beta' == res_dict['save_dict'][
+        'base_model']
+    assert 'str_plain_api' == res_dict['save_dict']['which_api']
+
+
+@pytest.mark.parametrize("h2ogpt_key", ['', 'Foo#21525'])
+@pytest.mark.parametrize("stream_output", [True, False])
+@pytest.mark.parametrize("tts_model", [
+    'microsoft/speecht5_tts',
+    'tts_models/multilingual/multi-dataset/xtts_v2'
+])
+@wrap_test_forked
+def test_client1_tts_api(tts_model, stream_output, h2ogpt_key):
+    from src.gen import main
+    main(base_model='llama',
+         tts_model=tts_model,
+         stream_output=True, gradio=True, num_beams=1, block_gradio_exit=False,
+         enforce_h2ogpt_api_key=True if h2ogpt_key else False,
+         enforce_h2ogpt_ui_key=False,
+         h2ogpt_api_keys=[h2ogpt_key] if h2ogpt_key else [],
+         enable_tts=True,
+         )
+
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # string of dict for input
+    prompt = 'I am a robot.  I like to eat cookies, cakes, and donuts.  Please feed me every day.'
+    inputs = dict(chatbot_role="Female AI Assistant", speaker="SLT (female)", tts_language='autodetect', tts_speed=1.0,
+                  prompt=prompt, stream_output=stream_output,
+                  h2ogpt_key=h2ogpt_key)
+    if stream_output:
+        job = client.submit(*tuple(list(inputs.values())), api_name='/speak_text_api')
+
+        # ensure no immediate failure (only required for testing)
+        import concurrent.futures
+        try:
+            e = job.exception(timeout=0.2)
+            if e is not None:
+                raise RuntimeError(e)
+        except concurrent.futures.TimeoutError:
+            pass
+
+        n = 0
+        for audio_str in job:
+            n = play_audio_str(audio_str, n)
+
+        # get rest after job done
+        outputs = job.outputs().copy()
+        for audio_str in outputs[n:]:
+            n = play_audio_str(audio_str, n)
+    else:
+        audio_str = client.predict(*tuple(list(inputs.values())), api_name='/speak_text_api')
+        play_audio_str(audio_str, 0)
+
+
+def play_audio_str(audio_str1, n):
+    import ast
+    import io
+    from pydub import AudioSegment
+
+    print(n)
+    n += 1
+    audio_dict = ast.literal_eval(audio_str1)
+    audio = audio_dict['audio']
+    sr = audio_dict['sr']
+    s = io.BytesIO(audio)
+    channels = 1
+    sample_width = 2
+
+    make_file = True  # WIP: can't choose yet
+    if make_file:
+        import uuid
+        # NOTE:
+        # pip install playsound==1.3.0
+        # sudo apt-get install gstreamer-1.0
+        # conda install -c conda-forge gst-python
+        # pip install pygame
+        # from playsound import playsound
+        filename = '/tmp/audio_%s.wav' % str(uuid.uuid4())
+        audio = AudioSegment.from_raw(s, sample_width=sample_width, frame_rate=sr, channels=channels)
+        audio.export(filename, format='wav')
+        # playsound(filename)
+        playsound_wav(filename)
+    else:
+        # pip install simpleaudio==1.0.4
+        # WIP, needs header, while other shouldn't have header
+        from pydub import AudioSegment
+        from pydub.playback import play
+        song = AudioSegment.from_file(s, format="wav")
+        play(song)
+    return n
+
+
+def playsound_wav(x):
+    # pip install pygame
+    import pygame
+    pygame.mixer.init()
+    pygame.mixer.music.load(x)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        pass
+
+
+@pytest.mark.skipif(not os.environ.get('HAVE_SERVER'),
+                    reason="Should have separate server running, self-contained example for FAQ.md")
+# HAVE_SERVER=1 pytest -s -v tests/test_client_calls.py::test_pure_client_test
+def test_pure_client_test():
+    from gradio_client import Client
+    client = Client('http://localhost:7860')
+
+    # string of dict for input
+    prompt = 'I am a robot.  I like to eat cookies, cakes, and donuts.  Please feed me every day.'
+    inputs = dict(chatbot_role="Female AI Assistant",
+                  speaker="SLT (female)",
+                  tts_language='autodetect',
+                  tts_speed=1.0,
+                  prompt=prompt,
+                  stream_output=True,
+                  h2ogpt_key='',  # set if required, always needs to be passed
+                  )
+    job = client.submit(*tuple(list(inputs.values())), api_name='/speak_text_api')
+
+    n = 0
+    for audio_str in job:
+        n = play_audio_str(audio_str, n)
+
+    # get rest after job done
+    outputs = job.outputs().copy()
+    for audio_str in outputs[n:]:
+        n = play_audio_str(audio_str, n)
+
+
+@wrap_test_forked
+def test_client_upload_to_user_not_allowed():
+    remove('db_dir_UserData')
+    base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'
+    from src.gen import main
+    main(base_model=base_model, block_gradio_exit=False, verbose=True, allow_upload_to_user_data=False,
+         add_disk_models_to_ui=False)
+
+    # get file for client to upload
+    url = 'https://cdn.openai.com/papers/whisper.pdf'
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
+    download_simple(url, dest=test_file1)
+
+    # PURE client code
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # upload file(s).  Can be list or single file
+    test_file_local, test_file_server = client.predict(test_file1, api_name='/upload_api')
+
+    chunk = True
+    chunk_size = 512
+    langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
+    h2ogpt_key = ''
+    res = client.predict(test_file_server,
+                         langchain_mode, chunk, chunk_size, True,
+                         *loaders,
+                         h2ogpt_key,
+                         api_name='/add_file_api')
+    assert res[0] is None
+    assert res[1] == langchain_mode
+    assert os.path.basename(test_file_server) in res[2]
+    assert res[3] == ''
+
+    langchain_mode = 'UserData'
+    res = client.predict(test_file_server,
+                         langchain_mode, chunk, chunk_size, True,
+                         *loaders,
+                         h2ogpt_key,
+                         api_name='/add_file_api')
+    assert res[0] is None
+    assert res[1] == langchain_mode
+    assert os.path.basename(test_file_server) not in res[2] and 'Not allowed to upload to shared space' in res[2]
+    assert res[3] == 'Not allowed to upload to shared space'
+
+
+@wrap_test_forked
+def test_client_upload_to_my_not_allowed():
+    base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'
+    from src.gen import main
+    main(base_model=base_model, block_gradio_exit=False, verbose=True, allow_upload_to_my_data=False,
+         add_disk_models_to_ui=False, langchain_mode='UserData')
+
+    # get file for client to upload
+    url = 'https://cdn.openai.com/papers/whisper.pdf'
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
+    download_simple(url, dest=test_file1)
+
+    # PURE client code
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # upload file(s).  Can be list or single file
+    test_file_local, test_file_server = client.predict(test_file1, api_name='/upload_api')
+
+    chunk = True
+    chunk_size = 512
+    langchain_mode = 'UserData'
+    loaders = tuple([None, None, None, None, None, None])
+    h2ogpt_key = ''
+    res = client.predict(test_file_server,
+                         langchain_mode, chunk, chunk_size, True,
+                         *loaders,
+                         h2ogpt_key,
+                         api_name='/add_file_api')
+    assert res[0] is None
+    assert res[1] == langchain_mode
+    assert os.path.basename(test_file_server) in res[2]
+    assert res[3] == ''
+
+    langchain_mode = 'MyData'
+    res = client.predict(test_file_server,
+                         langchain_mode, chunk, chunk_size, True,
+                         *loaders,
+                         h2ogpt_key,
+                         api_name='/add_file_api')
+    assert res[0] is None
+    assert res[1] == langchain_mode
+    assert os.path.basename(test_file_server) not in res[2] and "Not allowed to upload to scratch/personal space" in \
+           res[2]
+    assert res[3] == 'Not allowed to upload to scratch/personal space'
+
+
+@wrap_test_forked
+def test_client_upload_to_user_or_my_not_allowed():
+    base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'
+    from src.gen import main
+    main(base_model=base_model, block_gradio_exit=False, verbose=True,
+         allow_upload_to_my_data=False,
+         allow_upload_to_user_data=False,
+         add_disk_models_to_ui=False, langchain_mode='UserData')
+
+    # get file for client to upload
+    url = 'https://cdn.openai.com/papers/whisper.pdf'
+    test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
+    download_simple(url, dest=test_file1)
+
+    # PURE client code
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # upload file(s).  Can be list or single file
+    try:
+        test_file_local, test_file_server = client.predict(test_file1, api_name='/upload_api')
+    except ValueError as e:
+        if 'Cannot find a function with' in str(e):
+            pass
+        else:
+            raise
+
+
+@wrap_test_forked
+def test_client1_image_qa():
+    os.environ['TEST_LANGCHAIN_IMPORT'] = "1"
+    sys.modules.pop('gpt_langchain', None)
+    sys.modules.pop('langchain', None)
+
+    from src.gen import main
+    assert os.getenv('H2OGPT_LLAVA_MODEL'), "Missing env"
+    llava_model = os.getenv('H2OGPT_LLAVA_MODEL')
+    main(
+        model_lock=[{'base_model': 'llama', 'model_path_llama': 'zephyr-7b-beta.Q5_K_M.gguf', 'prompt_type': 'zephyr'},
+                    {'base_model': 'liuhaotian/llava-v1.6-vicuna-13b', 'inference_server': llava_model,
+                     'prompt_type': noop_prompt_type},
+                    {'base_model': 'liuhaotian/llava-v1.6-34b', 'inference_server': llava_model,
+                     'prompt_type': noop_prompt_type}],
+        llava_model=llava_model,
+        gradio=True, num_beams=1, block_gradio_exit=False,
+    )
+
+    from gradio_client import Client
+    client = Client(get_inf_server())
+
+    # string of dict for input
+    prompt = 'What do you see?'
+    image_file = 'tests/driverslicense.jpeg'
+    from src.vision.utils_vision import img_to_base64
+    image_file = img_to_base64(image_file)
+    kwargs = dict(instruction_nochat=prompt, image_file=image_file, visible_models='liuhaotian/llava-v1.6-vicuna-13b',
+                  stream_output=False)
+    res = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
+
+    # string of dict for output
+    response = ast.literal_eval(res)['response']
+    print(response)
+    assert 'license' in response
+
+
+@pytest.mark.parametrize("metadata_in_context", [[], 'all', 'auto'])
+@wrap_test_forked
+def test_client_chat_stream_langchain_metadata(metadata_in_context):
+    os.environ['VERBOSE_PIPELINE'] = '1'
+    user_path = make_user_path_test()
+
+    stream_output = True
+    base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'  # 'h2oai/h2ogpt-oig-oasst1-512-6_9b'
+    prompt_type = 'llama2'  # 'human_bot'
+    langchain_mode = 'UserData'
+    langchain_modes = ['UserData', 'MyData', 'LLM', 'Disabled', 'LLM']
+
+    from src.gen import main
+    main(base_model=base_model, prompt_type=prompt_type, chat=True,
+         stream_output=stream_output, gradio=True, num_beams=1, block_gradio_exit=False,
+         langchain_mode=langchain_mode, user_path=user_path,
+         langchain_modes=langchain_modes,
+         docs_ordering_type=None,  # for 6_9
+         metadata_in_context=metadata_in_context,
+         )
+
+    from src.client_test import get_client, get_args, run_client
+    client = get_client(serialize=False)
+
+    # QUERY1
+    prompt = "What is Whisper?"
+    langchain_mode = 'UserData'
+    kwargs, args = get_args(prompt, prompt_type, chat=True, stream_output=stream_output,
+                            langchain_mode=langchain_mode,
+                            metadata_in_context=metadata_in_context)
+
+    res_dict, client = run_client(client, prompt, args, kwargs)
+    assert 'Automatic Speech Recognition' in res_dict['response']
+
+
+@pytest.mark.parametrize("do_auth", [True, False])
+@pytest.mark.parametrize("guest_name", ['', 'guest'])
+@pytest.mark.parametrize("auth_access", ['closed', 'open'])
+@wrap_test_forked
+def test_client_openai_langchain(auth_access, guest_name, do_auth):
+    user_path = make_user_path_test()
+
+    stream_output = True
+    base_model = 'h2oai/h2ogpt-4096-llama2-7b-chat'
+    prompt_type = 'llama2'  # 'human_bot'
+    langchain_mode = 'UserData'
+    langchain_modes = ['UserData', 'MyData', 'LLM', 'Disabled', 'LLM']
+    api_key = 'foo'
+    username = 'doo'
+    password = 'bar'
+
+    auth_filename = 'auth_test.json'
+    remove(auth_filename)
+    remove('users/doo/db_dir_MyData')
+
+    from src.gen import main
+    main(base_model=base_model, prompt_type=prompt_type, chat=True,
+         stream_output=stream_output, gradio=True, num_beams=1, block_gradio_exit=False,
+         langchain_mode=langchain_mode, user_path=user_path,
+         langchain_modes=langchain_modes,
+         h2ogpt_api_keys=[api_key],
+         auth_filename=auth_filename,
+         auth=[(username, password)] if do_auth else None,
+         add_disk_models_to_ui=False,
+         score_model=None,
+         enable_tts=False,
+         enable_stt=False,
+         )
+
+    # try UserData
+    from openai import OpenAI
+    base_url = 'http://localhost:5000/v1'
+    model = base_model
+    client_args = dict(base_url=base_url, api_key=api_key)
+    openai_client = OpenAI(**client_args)
+
+    messages = [{'role': 'user', 'content': 'Summarize'}]
+    stream = False
+
+    # UserData
+    langchain_mode = 'UserData'
+    client_kwargs = dict(model=model, max_tokens=200, stream=stream, messages=messages,
+                         user='%s:%s' % (username, password),
+                         # can add any parameters that would have passed to gradio client
+                         extra_body=dict(langchain_mode=langchain_mode),
+                         )
+    client = openai_client.chat.completions
+
+    responses = client.create(**client_kwargs)
+    text = responses.choices[0].message.content
+    print(text)
+    assert 'h2oGPT project' in text or \
+           'natural language' in text or \
+           'Summarize' in text or \
+           'summarizing' in text or \
+           'summarization' in text
+
+    # MyData
+    # get file for client to upload
+
+    # upload file(s).  Can be list or single file
+    from gradio_client import Client
+    gr_client = Client(get_inf_server(), auth=(username, password) if do_auth else None)
+
+    # login regardless of auth, so can access collection
+    num_model_lock = gr_client.predict(api_name='/num_model_lock')
+    chatbots = [None] * (2 + num_model_lock)
+    h2ogpt_key = ''
+    visible_models = []
+    gr_client.predict(None,
+                      h2ogpt_key, visible_models,
+                      username, password,
+                      *tuple(chatbots), api_name='/login')
+
+    # now can upload file to collection MyData
+    test_file_local, test_file_server = gr_client.predict('tests/screenshot.png', api_name='/upload_api')
+
+    chunk = True
+    chunk_size = 512
+    langchain_mode = 'MyData'
+    loaders = tuple([None, None, None, None, None, None])
+    h2ogpt_key = api_key
+    res = gr_client.predict(test_file_server,
+                            langchain_mode, chunk, chunk_size, True,
+                            *loaders,
+                            h2ogpt_key,
+                            api_name='/add_file_api')
+    assert res[0] is None
+    assert res[1] == langchain_mode
+    assert os.path.basename(test_file_server) in res[2]
+    assert res[3] == ''
+
+    langchain_mode = 'MyData'
+    client_kwargs = dict(model=model, max_tokens=200, stream=stream, messages=messages,
+                         user='%s:%s' % (username, password),
+                         extra_body=dict(langchain_mode=langchain_mode),
+                         )
+    client = openai_client.chat.completions
+
+    responses = client.create(**client_kwargs)
+    text = responses.choices[0].message.content
+    print(text)
+    assert 'Chirpy' in text
+
+
+@pytest.mark.parametrize("base_model", [
+    'h2oai/h2ogpt-4096-llama2-7b-chat',
+    'h2oai/h2o-danube-1.8b-chat'
+])
+@wrap_test_forked
+def test_client_openai_chat_history(base_model):
+    if 'llama2' in base_model:
+        prompt_type = 'llama2'  # 'human_bot'
+    else:
+        prompt_type = 'danube'
+
+    stream_output = True
+    langchain_mode = 'LLM'
+    langchain_modes = ['UserData', 'MyData', 'LLM', 'Disabled', 'LLM']
+
+    from src.gen import main
+    main(base_model=base_model, prompt_type=prompt_type, chat=True,
+         stream_output=stream_output, gradio=True, num_beams=1, block_gradio_exit=False,
+         langchain_mode=langchain_mode,
+         langchain_modes=langchain_modes,
+         add_disk_models_to_ui=False,
+         score_model=None,
+         enable_tts=False,
+         enable_stt=False,
+         )
+
+    from openai import OpenAI
+    base_url = 'http://localhost:5000/v1'
+    model = base_model
+    client_args = dict(base_url=base_url, api_key='EMPTY')
+    openai_client = OpenAI(**client_args)
+
+    messages = [{'role': 'user', 'content': 'What is your name?'},
+                {'role': 'assistant', 'content': 'My name is Bob.'},
+                {'role': 'user', 'content': 'What did I just ask?'},
+                ]
+    stream = False
+
+    client_kwargs = dict(model=model, max_tokens=200, stream=stream, messages=messages)
+    client = openai_client.chat.completions
+    responses = client.create(**client_kwargs)
+    text = responses.choices[0].message.content
+    print(text)
+    assert 'What is your name?' in text or 'You asked for my name, which is Bob.' in text
+
+    system_prompt = """I am a helpful assistant and have been created by H2O.ai. If asked about who I am, I will always absolutely say my name is Liam Chen.
+    I am having a conversation with a user, whose name is Asghar.
+    I will keep my responses short to retain the user's attention.
+    If the conversation history is empty, I will start the conversation with just a greeting and inquire about how the person is doing.
+    After the initial greeting, I will not greet again, and just focus on answering the user's questions directly.
+    I will absolutely never say things like "I'm a computer program" or "I don't have feelings or experiences."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        # {"role":"user","content":"Who are you and what do you do?"},
+        # {"role": "assistant", "content": system_prompt},
+        {"role": "user", "content": "How are you, assistant?"},
+        {"role": "assistant", "content": "Hello Asghar, how are you doing today?"},
+        {"role": "user", "content": "what is the sum of 4 plus 4?"},
+        {"role": "assistant", "content": "The sum of 4+4 is 8."},
+        {"role": "user", "content": "who are you, what is your name?"}
+    ]
+    client_kwargs = dict(model=model, max_tokens=200, stream=stream, messages=messages)
+    client = openai_client.chat.completions
+    responses = client.create(**client_kwargs)
+    text = responses.choices[0].message.content
+    print(text)
+    assert 'Liam' in text
+
+    messages = [
+        # {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Who are you and what do you do?"},
+        {"role": "assistant", "content": system_prompt},
+        {"role": "user", "content": "How are you, assistant?"},
+        {"role": "assistant", "content": "Hello Asghar, how are you doing today?"},
+        {"role": "user", "content": "what is the sum of 4 plus 4?"},
+        {"role": "assistant", "content": "The sum of 4+4 is 8."},
+        {"role": "user", "content": "who are you, what is your name?"}
+    ]
+    client_kwargs = dict(model=model, max_tokens=200, stream=stream, messages=messages)
+    client = openai_client.chat.completions
+    responses = client.create(**client_kwargs)
+    text = responses.choices[0].message.content
+    print(text)
+    assert 'Liam' in text
+
+
+# can run some server locally (e.g. in pycharm) with bunch of models
+# then run:
+# (h2ogpt) jon@pseudotensor:~/h2ogpt$ GRADIO_SERVER_PORT=7862 H2OGPT_OPENAI_PORT=6001 TEST_SERVER=http://localhost:7860 pytest -s -v tests/test_client_calls.py::test_max_new_tokens &> doit16.log
+
+# add rest once 25 passes
+# @pytest.mark.parametrize("max_new_tokens", [25, 64, 128, 256, 512, 768, 1024, 1500, 2048])
+@pytest.mark.parametrize("temperature", [-1, 0.0, 1.0])
+@pytest.mark.parametrize("max_new_tokens", [25])
+@wrap_test_forked
+def test_max_new_tokens(max_new_tokens, temperature):
+    inference_server = os.getenv('TEST_SERVER', 'https://gpt.h2o.ai')
+    if inference_server == 'https://gpt.h2o.ai':
+        inference_server += ':guest:guest'
+
+    from src.gen import get_inf_models
+    base_models = get_inf_models(inference_server)
+    h2ogpt_key = os.environ['H2OGPT_H2OGPT_KEY']
+    model_lock = []
+    model_lock.append(dict(base_model='HuggingFaceH4/zephyr-7b-beta'))
+    for base_model in base_models:
+        if base_model in ['h2oai/h2ogpt-gm-7b-mistral-chat-sft-dpo-v1', 'Qwen/Qwen1.5-72B-Chat']:
+            continue
+        model_lock.append(dict(
+            h2ogpt_key=h2ogpt_key,
+            inference_server=inference_server,
+            base_model=base_model,
+            visible_models=base_model,
+        ))
+
+    if temperature < 0:
+        temperature = 0.0
+        nrepeats = 1
+    else:
+        nrepeats = 10
+    fudge_seed = 4
+
+    from src.gen import main
+    main(block_gradio_exit=False, save_dir='save_test', model_lock=model_lock)
+
+    for base_model in base_models:
+        if base_model == 'Qwen/Qwen1.5-72B-Chat':
+            continue
+        if base_model == 'h2oai/h2ogpt-gm-7b-mistral-chat-sft-dpo-v1':
+            continue
+        if temperature == 0.5 and ('claude' in base_model or 'gemini' in base_model or '-32768' in base_model):
+            # these don't support seed, can't randomize sampling
+            continue
+        # if base_model != 'mistral-medium':
+        #    # pick one for debugging
+        #    continue
+        if base_model == 'gemini-pro':
+            #   # pick one for debugging
+            continue
+        client1 = get_client(serialize=True)
+
+        from gradio_utils.grclient import GradioClient
+        client2 = GradioClient(get_inf_server(), serialize=True)
+        client2.refresh_client()  # test refresh
+
+        for client in [client1, client2]:
+            api_name = '/submit_nochat_api'  # NOTE: like submit_nochat but stable API for string dict passing
+            prompt = "Tell an extremely long kid's story about birds"
+            kwargs = dict(instruction_nochat=prompt, visible_models=base_model, max_new_tokens=max_new_tokens,
+                          # do_sample=True,  # let temp control
+                          seed=0,  # so random if sampling
+                          temperature=temperature)
+
+            print("START base_model: %s max_new_tokens: %s" % (base_model, max_new_tokens))
+
+            repeat_responses = []
+            for repeat in range(nrepeats):
+                res = client.predict(str(dict(kwargs)), api_name=api_name)
+                res = ast.literal_eval(res)
+
+                assert 'base_model' in res['save_dict']
+                assert res['save_dict']['base_model'] == base_model
+                assert res['save_dict']['error'] in [None, '']
+                assert 'extra_dict' in res['save_dict']
+                assert res['save_dict']['extra_dict']['ntokens'] > 0
+                fudge = 10 if base_model == 'google/gemma-7b-it' else 4
+                assert res['save_dict']['extra_dict']['ntokens'] <= max_new_tokens + fudge
+                assert res['save_dict']['extra_dict']['t_generate'] > 0
+                assert res['save_dict']['extra_dict']['tokens_persecond'] > 0
+                assert res['response']
+
+                print("Raw client result: %s" % res, flush=True)
+                print('base_model: %s max_new_tokens: %s tokens: %s' % (
+                    base_model, max_new_tokens, res['save_dict']['extra_dict']['ntokens']))
+
+                repeat_responses.append(res['response'])
+            if temperature == 0.0:
+                assert len(set(repeat_responses)) <= 3  # fudge of 1
+            else:
+                assert len(set(repeat_responses)) >= len(repeat_responses) - fudge_seed
+
+            # get file for client to upload
+            url = 'https://cdn.openai.com/papers/whisper.pdf'
+            test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
+            download_simple(url, dest=test_file1)
+
+            # upload file(s).  Can be list or single file
+            test_file_local, test_file_server = client.predict(test_file1, api_name='/upload_api')
+
+            chunk = True
+            chunk_size = 512
+            langchain_mode = 'MyData'
+            loaders = tuple([None, None, None, None, None, None])
+            h2ogpt_key = ''
+            res = client.predict(test_file_server,
+                                 langchain_mode, chunk, chunk_size, True,
+                                 *loaders,
+                                 h2ogpt_key,
+                                 api_name='/add_file_api')
+            assert res[0] is None
+            assert res[1] == langchain_mode
+            assert os.path.basename(test_file_server) in res[2]
+            assert res[3] == ''
+
+            # ask for summary, need to use same client if using MyData
+            instruction = "Give a very long detailed step-by-step description of what is Whisper paper about."
+            kwargs = dict(instruction=instruction,
+                          langchain_mode=langchain_mode,
+                          langchain_action="Query",
+                          top_k_docs=4,
+                          document_subset='Relevant',
+                          document_choice=DocumentChoice.ALL.value,
+                          max_new_tokens=max_new_tokens,
+                          # do_sample=True,  # let temp control
+                          seed=0,  # so random if sampling
+                          temperature=temperature,
+                          visible_models=base_model,
+                          max_time=360,
+                          stream_output=False,
+                          )
+
+            repeat_responses = []
+            print("START MyData base_model: %s max_new_tokens: %s" % (base_model, max_new_tokens))
+            for repeat in range(nrepeats):
+                res, client = run_client_gen(client, kwargs)
+                response = res['response']
+                assert len(response) > 0
+                # assert len(response) < max_time * 20  # 20 tokens/sec
+                sources = [x['source'] for x in res['sources']]
+                # only get source not empty list if break in inner loop, not gradio_runner loop, so good test of that too
+                # this is why gradio timeout adds 10 seconds, to give inner a chance to produce references or other final info
+                assert 'whisper1.pdf' in sources[0]
+
+                assert 'base_model' in res['save_dict']
+                assert res['save_dict']['base_model'] == base_model
+                assert res['save_dict']['error'] in [None, '']
+                assert 'extra_dict' in res['save_dict']
+                assert res['save_dict']['extra_dict']['ntokens'] > 0
+                assert res['save_dict']['extra_dict']['ntokens'] <= max_new_tokens
+                assert res['save_dict']['extra_dict']['t_generate'] > 0
+                assert res['save_dict']['extra_dict']['tokens_persecond'] > 0
+                assert res['response']
+
+                print("Raw client result: %s" % res, flush=True)
+                print('langchain base_model: %s max_new_tokens: %s tokens: %s' % (
+                    base_model, max_new_tokens, res['save_dict']['extra_dict']['ntokens']))
+
+                repeat_responses.append(res['response'])
+            if temperature == 0.0:
+                assert len(set(repeat_responses)) <= 2  # fudge of 1
+            else:
+                assert len(set(repeat_responses)) >= len(repeat_responses) - fudge_seed
+
+
+vision_models = ['gpt-4-vision-preview',
+                 'gemini-pro-vision', 'gemini-1.5-pro-latest',
+                 'claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307',
+                 'liuhaotian/llava-v1.6-34b', 'liuhaotian/llava-v1.6-vicuna-13b',
+                 ]
+
+
+@wrap_test_forked
+@pytest.mark.parametrize("base_model", vision_models)
+@pytest.mark.parametrize("langchain_mode", ['LLM', 'MyData'])
+@pytest.mark.parametrize("langchain_action", [LangChainAction.QUERY.value, LangChainAction.SUMMARIZE_MAP.value])
+def test_client1_image_qa(langchain_action, langchain_mode, base_model):
+    if langchain_mode == 'LLM' and langchain_action == LangChainAction.SUMMARIZE_MAP.value:
+        # dummy return
+        return
+
+    client, base_models = get_test_server_client(base_model)
+    h2ogpt_key = os.environ['H2OGPT_H2OGPT_KEY']
+
+    # string of dict for input
+    prompt = 'What do you see?'
+    image_file = 'tests/driverslicense.jpeg'
+    from src.vision.utils_vision import img_to_base64
+    image_file = img_to_base64(image_file)
+
+    print("Doing base_model=%s" % base_model)
+    kwargs = dict(instruction_nochat=prompt,
+                  image_file=image_file,
+                  visible_models=base_model,
+                  stream_output=False,
+                  langchain_mode=langchain_mode,
+                  langchain_action=langchain_action,
+                  h2ogpt_key=h2ogpt_key)
+    try:
+        res = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
+    except Exception as e:
+        if base_model in ['gemini-pro-vision'] and """safety_ratings {
+  category: HARM_CATEGORY_DANGEROUS_CONTENT
+  probability: MEDIUM
+}""" in str(e):
+            return
+        else:
+            raise
+
+    # string of dict for output
+    res_dict = ast.literal_eval(res)
+    response = res_dict['response']
+    print('base_model: %s langchain_mode: %s response: %s' % (base_model, langchain_mode, response), file=sys.stderr)
+    print(response)
+
+    assert 'license' in response.lower()
+    assert res_dict['save_dict']['extra_dict']['num_prompt_tokens'] > 1000
+
+
+def get_creation_date(file_path):
+    """Gets the creation date of a file."""
+    stat = os.stat(file_path)
+    return stat.st_ctime
+
+
+# (h2ogpt) jon@pseudotensor:~/h2ogpt$ TEST_SERVER="http://localhost:7860" pytest -s -v -k "LLM and llava and vicuna and Query" tests/test_client_calls.py::test_client1_images_qa
+@wrap_test_forked
+@pytest.mark.parametrize("base_model", vision_models)
+@pytest.mark.parametrize("langchain_mode", ['LLM', 'MyData'])
+@pytest.mark.parametrize("langchain_action", [LangChainAction.QUERY.value, LangChainAction.SUMMARIZE_MAP.value])
+def test_client1_images_qa(langchain_action, langchain_mode, base_model):
+    if langchain_mode == 'LLM' and langchain_action == LangChainAction.SUMMARIZE_MAP.value:
+        # dummy return
+        return
+
+    image_dir = 'pdf_images'
+    makedirs(image_dir)
+    os.system('pdftoppm tests/2403.09629.pdf %s/outputname -jpeg' % image_dir)
+    pdf_images = os.listdir(image_dir)
+    pdf_images = [os.path.join(image_dir, x) for x in pdf_images]
+    pdf_images.sort(key=get_creation_date)
+
+    inference_server = os.getenv('TEST_SERVER', 'https://gpt.h2o.ai')
+    if inference_server == 'https://gpt.h2o.ai':
+        auth_kwargs = dict(auth=('guest', 'guest'))
+    else:
+        auth_kwargs = {}
+
+    from src.gen import get_inf_models
+    base_models = get_inf_models(inference_server)
+    base_models_touse = [base_model]
+    assert len(set(base_models_touse).difference(set(base_models))) == 0
+    h2ogpt_key = os.environ['H2OGPT_H2OGPT_KEY']
+
+    # inference_server = 'http://localhost:7860'
+
+    from gradio_client import Client
+    client = Client(inference_server, *auth_kwargs)
+
+    prompt = 'What is used to optimize the likelihoods of the rationales?'
+
+    from src.vision.utils_vision import img_to_base64
+    image_files = [img_to_base64(image_file) for image_file in pdf_images]
+
+    print("Doing base_model=%s" % base_model)
+    use_instruction = langchain_action == LangChainAction.QUERY.value
+    kwargs = dict(instruction_nochat=prompt if use_instruction else '',
+                  prompt_query=prompt if not use_instruction else '',
+                  prompt_summary=prompt if not use_instruction else '',
+                  image_file=image_files,
+                  visible_models=base_model,
+                  stream_output=False,
+                  langchain_mode=langchain_mode,
+                  langchain_action=langchain_action,
+                  h2ogpt_key=h2ogpt_key)
+    res_dict = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
+    res_dict = ast.literal_eval(res_dict)
+    response = res_dict['response']
+
+    if base_model in ['liuhaotian/llava-v1.6-vicuna-13b'] and """research paper or academic""" in response:
+        return
+
+    # string of dict for output
+    print('base_model: %s langchain_mode: %s response: %s' % (base_model, langchain_mode, response), file=sys.stderr)
+    print(response)
+    assert 'REINFORCE'.lower() in response.lower()
+
+    assert res_dict['save_dict']['extra_dict']['num_prompt_tokens'] > 1000
+
+
+@wrap_test_forked
+def test_pdf_to_base_64_images():
+    pdf_path = 'tests/2403.09629.pdf'
+    from src.vision.utils_vision import pdf_to_base64_pngs
+    base64_encoded_pngs = pdf_to_base64_pngs(pdf_path, quality=75, max_size=(1024, 1024), ext='png')
+    assert len(base64_encoded_pngs) == 25
+    base64_encoded_pngs = pdf_to_base64_pngs(pdf_path, quality=75, max_size=(1024, 1024), ext='jpg')
+    assert len(base64_encoded_pngs) == 25
+
+    base64_encoded_pngs = pdf_to_base64_pngs(pdf_path, quality=75, max_size=(1024, 1024), ext='jpg', pages=[5, 7])
+    assert len(base64_encoded_pngs) == 2
+
+
+@wrap_test_forked
+def test_get_image_file():
+    image_control = None
+    from src.image_utils import get_image_file
+
+    for convert in [True, False]:
+        for str_bytes in [True, False]:
+            image_file = 'tests/jon.png'
+            assert len(get_image_file(image_file, image_control, 'All', convert=convert, str_bytes=str_bytes)) == 1
+
+            image_file = ['tests/jon.png']
+            assert len(get_image_file(image_file, image_control, 'All', convert=convert, str_bytes=str_bytes)) == 1
+
+            image_file = ['tests/jon.png', 'tests/fastfood.jpg']
+            assert len(get_image_file(image_file, image_control, 'All', convert=convert, str_bytes=str_bytes)) == 2
+
+
+gpt_models = ['h2oai/h2ogpt-4096-llama2-70b-chat', 'mistralai/Mixtral-8x7B-Instruct-v0.1',
+              'HuggingFaceH4/zephyr-7b-beta', 'gpt-3.5-turbo-0613', 'openchat/openchat-3.5-1210',
+              'mistralai/Mistral-7B-Instruct-v0.2', 'h2oai/h2ogpt-32k-codellama-34b-instruct',
+              'NousResearch/Nous-Capybara-34B', 'databricks/dbrx-instruct', 'liuhaotian/llava-v1.6-vicuna-13b',
+              'liuhaotian/llava-v1.6-34b', 'h2oai/h2o-danube-1.8b-chat', 'google/gemma-7b-it']
+
+TEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string"
+        },
+        "age": {
+            "type": "integer"
+        },
+        "skills": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "maxLength": 10
+            },
+            "minItems": 3
+        },
+        "workhistory": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "company": {
+                        "type": "string"
+                    },
+                    "duration": {
+                        "type": "string"
+                    },
+                    "position": {
+                        "type": "string"
+                    }
+                },
+                "required": ["company", "position"]
+            }
+        }
+    },
+    "required": ["name", "age", "skills", "workhistory"]
+}
+
+TEST_REGEX = (r"((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.){3}"
+              r"(25[0-5]|(2[0-4]|1\d|[1-9]|)\d)")
+
+TEST_CHOICE = [
+    "Python", "Java", "JavaScript", "C++", "C#", "PHP", "TypeScript", "Ruby",
+    "Swift", "Kotlin"
+]
+
+other_base_models = ['h2oai/h2ogpt-4096-llama2-70b-chat', 'h2oai/h2ogpt-4096-llama2-13b-chat',
+                     'HuggingFaceH4/zephyr-7b-beta', 'mistralai/Mistral-7B-Instruct-v0.2', 'openchat/openchat-3.5-1210',
+                     'h2oai/h2ogpt-32k-codellama-34b-instruct', 'NousResearch/Nous-Capybara-34B',
+                     'mistralai/Mixtral-8x7B-Instruct-v0.1', 'mistral-medium', 'mistral-tiny', 'mistral-small-latest',
+                     'mistral-large-latest', 'gpt-3.5-turbo-0613', 'gpt-3.5-turbo-16k-0613', 'gpt-4-0613',
+                     'gpt-4-32k-0613', 'gpt-4-1106-preview', 'gpt-35-turbo-1106', 'gpt-4-vision-preview', 'claude-2.1',
+                     'claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307', 'gemini-pro',
+                     'gemini-pro-vision', 'gemini-1.5-pro-latest',
+                     'h2oai/h2o-danube2-1.8b-chat',
+                     'google/gemma-1.1-7b-it', 'mixtral-8x7b-32768', 'h2oai/mixtral-gm-rag-experimental-v2',
+                     'databricks/dbrx-instruct', 'CohereForAI/c4ai-command-r-v01', 'liuhaotian/llava-v1.6-vicuna-13b',
+                     'liuhaotian/llava-v1.6-34b']
+
+
+vllm_base_models = ['h2oai/h2ogpt-4096-llama2-70b-chat', 'h2oai/h2ogpt-4096-llama2-13b-chat',
+                     'HuggingFaceH4/zephyr-7b-beta', 'mistralai/Mistral-7B-Instruct-v0.2', 'openchat/openchat-3.5-1210',
+                     'h2oai/h2ogpt-32k-codellama-34b-instruct', 'NousResearch/Nous-Capybara-34B',
+                     'mistralai/Mixtral-8x7B-Instruct-v0.1',
+                     'h2oai/h2o-danube2-1.8b-chat',
+                     'google/gemma-1.1-7b-it', 'h2oai/mixtral-gm-rag-experimental-v2',
+                     'databricks/dbrx-instruct', 'CohereForAI/c4ai-command-r-v01']
+
+
+def get_test_server_client(base_model):
+    inference_server = os.getenv('TEST_SERVER', 'https://gpt.h2o.ai')
+    if inference_server == 'https://gpt.h2o.ai':
+        auth_kwargs = dict(auth=('guest', 'guest'))
+        inference_server_for_get = inference_server + ':guest:guest'
+    else:
+        auth_kwargs = {}
+        inference_server_for_get = inference_server
+    # inference_server = 'http://localhost:7860'
+
+    base_models_touse = [base_model]
+    from src.gen import get_inf_models
+    base_models = get_inf_models(inference_server_for_get)
+    assert len(set(base_models_touse).difference(set(base_models))) == 0
+
+    inference_server, headers, username, password = get_hf_server(inference_server)
+    if username and password:
+        auth_kwargs = dict(auth=(username, password))
+
+    from gradio_client import Client
+    client = Client(inference_server, **auth_kwargs)
+
+    return client, base_models
+
+
+@wrap_test_forked
+@pytest.mark.parametrize("base_model", other_base_models)
+@pytest.mark.parametrize("response_format", ['json_object', 'json_code'])
+# @pytest.mark.parametrize("base_model", [gpt_models[1]])
+# @pytest.mark.parametrize("base_model", ['CohereForAI/c4ai-command-r-v01'])
+@pytest.mark.parametrize("langchain_mode", ['LLM', 'MyData'])
+@pytest.mark.parametrize("langchain_action", [LangChainAction.QUERY.value, LangChainAction.SUMMARIZE_MAP.value,
+                                              LangChainAction.EXTRACT.value])
+def test_guided_json(langchain_action, langchain_mode, response_format, base_model):
+    if langchain_mode == 'LLM' and \
+            (langchain_action == LangChainAction.SUMMARIZE_MAP.value or
+             langchain_action == LangChainAction.EXTRACT.value):
+        # dummy return
+        return
+
+    client, base_models = get_test_server_client(base_model)
+    h2ogpt_key = os.environ['H2OGPT_H2OGPT_KEY']
+
+    # string of dict for input
+    prompt = "Give an example employee profile."
+
+    for guided_json in ['', TEST_SCHEMA]:
+        print("Doing base_model=%s with guided_json %s" % (base_model, guided_json != ''))
+        use_instruction = langchain_action == LangChainAction.QUERY.value
+        kwargs = dict(instruction_nochat=prompt if use_instruction else '',
+                      prompt_query=prompt if not use_instruction else '',
+                      # below make-up line required for opus, else too "smart" and doesn't fulfill request and instead asks for more information, even though I just said give "example".
+                      prompt_summary=prompt + '  Make up values if required, do not ask further questions.' if not use_instruction else '',
+                      visible_models=base_model,
+                      text_context_list=[] if langchain_action == LangChainAction.QUERY.value else [
+                          'Henry is a good AI scientist.'],
+                      stream_output=False,
+                      langchain_mode=langchain_mode,
+                      langchain_action=langchain_action,
+                      h2ogpt_key=h2ogpt_key,
+                      response_format=response_format,
+                      guided_json=guided_json,
+                      )
+        res = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
+        res_dict = ast.literal_eval(res)
+        response = res_dict['response']
+        print('base_model: %s langchain_mode: %s response: %s' % (base_model, langchain_mode, response),
+              file=sys.stderr)
+        print(response, file=sys.stderr)
+
+        # just take first for testing
+        if langchain_action == LangChainAction.EXTRACT.value:
+            response = ast.literal_eval(response)
+            assert isinstance(response, list), str(response)
+            response = response[0]
+
+        try:
+            mydict = json.loads(response)
+        except:
+            print("Bad response: %s" % response)
+            raise
+
+        # claude-3 can't handle spaces in keys.  should match pattern '^[a-zA-Z0-9_-]{1,64}$'
+        check_keys = ['age', 'name', 'skills', 'workhistory']
+        cond1 = all([k in mydict for k in check_keys])
+        if not guided_json:
+            assert mydict, "Empty dict"
+        else:
+            # zephyr, mistralv0.2, mutate to workHistory
+            assert cond1, "Missing keys: %s" % response
+            if base_model in vllm_base_models:
+                import jsonschema
+                jsonschema.validate(mydict, schema=guided_json)

@@ -1,11 +1,10 @@
 
-{{- if not .Values.h2ogpt.externalLLM.enabled }}
 {{- if .Values.h2ogpt.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "h2ogpt.fullname" . }}-config
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "h2ogpt.namespace" . | quote }}
   labels:
     {{- include "h2ogpt.labels" . | nindent 4 }}
 data:
@@ -19,7 +18,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "h2ogpt.fullname" . }}-tgi-inference-config
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "h2ogpt.namespace" . | quote }}
   labels:
     {{- include "h2ogpt.labels" . | nindent 4 }}
 data:
@@ -33,12 +32,11 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "h2ogpt.fullname" . }}-vllm-inference-config
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "h2ogpt.namespace" . | quote }}
   labels:
     {{- include "h2ogpt.labels" . | nindent 4 }}
 data:
 {{- range $key, $value := .Values.vllm.overrideConfig }}
   {{ printf "%s" $key | upper }}: {{ $value | quote }}
-{{- end }}
 {{- end }}
 {{- end }}

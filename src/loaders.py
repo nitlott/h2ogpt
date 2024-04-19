@@ -2,15 +2,20 @@ import functools
 import json
 
 from src.enums import t5_type
+from src.utils import have_optimum
 
 
-def get_loaders(model_name, reward_type, llama_type=None, load_gptq='', load_awq='', load_exllama=False,
+def get_loaders(model_name, reward_type, llama_type=None,
+                load_gptq='',
+                use_autogptq=False,
+                load_awq='',
+                load_exllama=False,
                 config=None,
                 rope_scaling=None, max_seq_len=None, model_name_exllama_if_no_config='',
                 exllama_dict=None, gptq_dict=None,
-                attention_sinks=None, sink_dict=None,
-                truncation_generation=None,
-                hf_model_dict=None,
+                hf_model_dict={},
+                force_seq2seq_type=False,
+                force_t5_type=False,
                 ):
     # NOTE: Some models need specific new prompt_type
     # E.g. t5_xxl_true_nli_mixture has input format: "premise: PREMISE_TEXT hypothesis: HYPOTHESIS_TEXT".)
@@ -76,7 +81,7 @@ def get_loaders(model_name, reward_type, llama_type=None, load_gptq='', load_awq
         cache = ExLlamaCache(model)  # create cache for inference
         generator = H2OExLlamaGenerator(model, tokenizer, cache)  # create generator
         return generator, tokenizer, False
-    if load_gptq:
+    if load_gptq and use_autogptq:
         if gptq_dict is None:
             gptq_dict = {}
         from transformers import AutoTokenizer
@@ -90,6 +95,8 @@ def get_loaders(model_name, reward_type, llama_type=None, load_gptq='', load_awq
                                          **gptq_dict,
                                          )
         return model_loader, AutoTokenizer, False
+    if load_gptq and not use_autogptq:
+        assert have_optimum, "To use HF transformers GPTQ, please: pip install optimum"
     if load_awq:
         from transformers import AutoTokenizer
         from awq import AutoAWQForCausalLM
@@ -99,18 +106,16 @@ def get_loaders(model_name, reward_type, llama_type=None, load_gptq='', load_awq
         return model_loader, AutoTokenizer, False
     if llama_type is None:
         llama_type = "llama" in model_name.lower()
-    if llama_type:
-        if attention_sinks:
-            # below will fail if don't have, to get just do in h2ogpt repo directory:
-            # pip install git+https://github.com/tomaarsen/attention_sinks.git
-            from attention_sinks import LlamaForCausalLM
-            from transformers import LlamaTokenizer
-            model_loader = functools.partial(LlamaForCausalLM.from_pretrained,
-                                             **sink_dict)
-            return model_loader, LlamaTokenizer, False
-        else:
-            from transformers import LlamaForCausalLM, LlamaTokenizer
-            return functools.partial(LlamaForCausalLM.from_pretrained, **hf_model_dict), LlamaTokenizer, False
+    if force_seq2seq_type:
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        return functools.partial(AutoModelForSeq2SeqLM.from_pretrained,
+                                 **hf_model_dict), AutoTokenizer, False
+    elif force_t5_type:
+        from transformers import AutoTokenizer, T5ForConditionalGeneration
+        return functools.partial(T5ForConditionalGeneration.from_pretrained, **hf_model_dict), AutoTokenizer, True
+    elif llama_type and not load_gptq:
+        from transformers import LlamaForCausalLM, LlamaTokenizer
+        return functools.partial(LlamaForCausalLM.from_pretrained, **hf_model_dict), LlamaTokenizer, False
     elif 'distilgpt2' in model_name.lower():
         from transformers import AutoModelForCausalLM, AutoTokenizer
         return functools.partial(AutoModelForCausalLM.from_pretrained, **hf_model_dict), AutoTokenizer, False
@@ -132,20 +137,14 @@ def get_loaders(model_name, reward_type, llama_type=None, load_gptq='', load_awq
     elif reward_type or 'OpenAssistant/reward-model'.lower() in model_name.lower():
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
         return functools.partial(AutoModelForSequenceClassification.from_pretrained, **hf_model_dict), AutoTokenizer, False
+    elif 'CohereForAI/aya-101'.lower() in model_name.lower():
+        from transformers import T5ForConditionalGeneration, AutoTokenizer
+        return functools.partial(T5ForConditionalGeneration.from_pretrained,
+                                 **hf_model_dict), AutoTokenizer, False
     else:
         from transformers import AutoTokenizer, AutoModelForCausalLM
         model_loader = functools.partial(AutoModelForCausalLM.from_pretrained, **hf_model_dict)
         tokenizer_loader = AutoTokenizer
-
-        if attention_sinks:
-            # below will fail if don't have, to get just do in h2ogpt repo directory:
-            # pip install git+https://github.com/tomaarsen/attention_sinks.git
-            from attention_sinks import AutoModelForCausalLM
-            from transformers import LlamaTokenizer
-            model_loader = functools.partial(AutoModelForCausalLM.from_pretrained,
-                                             **sink_dict)
-            return model_loader, tokenizer_loader, False
-
         return model_loader, tokenizer_loader, False
 
 

@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -20,46 +21,72 @@ import typing
 import urllib.error
 import uuid
 import zipfile
+import tarfile
 from collections import defaultdict
 from datetime import datetime
 from functools import reduce
 from operator import concat
+from random import randint
+from urllib.parse import urlparse
+
 import filelock
 import tabulate
-import yaml
 
 from joblib import delayed
-from langchain.callbacks import streaming_stdout
+from langchain_core.callbacks import streaming_stdout
 from langchain.callbacks.base import Callbacks
-from langchain.embeddings import HuggingFaceInstructEmbeddings
-from langchain.llms.huggingface_pipeline import VALID_TASKS
+from langchain_community.document_transformers import Html2TextTransformer, BeautifulSoupTransformer
+from langchain_community.embeddings import HuggingFaceInstructEmbeddings
+from langchain_community.llms.huggingface_pipeline import VALID_TASKS
 from langchain.llms.utils import enforce_stop_tokens
 from langchain.prompts.chat import ChatPromptValue
 from langchain.schema import LLMResult, Generation, PromptValue
 from langchain.schema.output import GenerationChunk
-from langchain.tools import PythonREPLTool
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatResult
+from langchain_experimental.tools import PythonREPLTool
 from langchain.tools.json.tool import JsonSpec
+from langchain_google_genai import ChatGoogleGenerativeAI
+#from langchain_mistralai import ChatMistralAI
+from src.langchain_mistralai.chat_models import ChatMistralAI
+from langchain_groq import ChatGroq
+from pydantic.v1 import root_validator
 from tqdm import tqdm
 
 from src.db_utils import length_db1, set_dbid, set_userid, get_dbid, get_userid_direct, get_username_direct, \
     set_userid_direct
+from src.image_utils import fix_image_file, get_image_types, get_image_file
+from src.output_parser import H2OPythonMRKLOutputParser
+from src.pandas_agent_langchain import create_csv_agent, create_pandas_dataframe_agent
 from utils import wrapped_partial, EThread, import_matplotlib, sanitize_filename, makedirs, get_url, flatten_list, \
     get_device, ProgressParallel, remove, hash_file, clear_torch_cache, NullContext, get_hf_server, FakeTokenizer, \
     have_libreoffice, have_arxiv, have_playwright, have_selenium, have_tesseract, have_doctr, have_pymupdf, set_openai, \
-    get_list_or_str, have_pillow, only_selenium, only_playwright, only_unstructured_urls, get_sha, get_short_name, \
+    get_list_or_str, have_pillow, only_selenium, only_playwright, only_unstructured_urls, get_short_name, \
     get_accordion, have_jq, get_doc, get_source, have_chromamigdb, get_token_count, reverse_ucurve_list, get_size, \
-    get_test_name_core
+    get_test_name_core, download_simple, have_fiftyone, have_librosa, return_good_url, n_gpus_global, \
+    get_accordion_named, hyde_titles, have_cv2, FullSet, create_relative_symlink, split_list, get_gradio_tmp, \
+    merge_dict, get_docs_tokens
 from enums import DocumentSubset, no_lora_str, model_token_mapping, source_prefix, source_postfix, non_query_commands, \
     LangChainAction, LangChainMode, DocumentChoice, LangChainTypes, font_size, head_acc, super_source_prefix, \
     super_source_postfix, langchain_modes_intrinsic, get_langchain_prompts, LangChainAgent, docs_joiner_default, \
-    docs_ordering_types_default, langchain_modes_non_db, \
-    does_support_functiontools, auto_choices
+    docs_ordering_types_default, langchain_modes_non_db, does_support_functiontools, doc_json_mode_system_prompt, \
+    auto_choices, max_docs_public, max_chunks_per_doc_public, max_docs_public_api, max_chunks_per_doc_public_api, \
+    user_prompt_for_fake_system_prompt, does_support_json_mode, claude3imagetag, gpt4imagetag, geminiimagetag, \
+    geminiimage_num_max, claude3image_num_max, gpt4image_num_max, llava_num_max, summary_prefix, extract_prefix, \
+    noop_prompt_type, unknown_prompt_type, template_prompt_type, none, claude3_image_tokens, gemini_image_tokens, \
+    gpt4_image_tokens
 from evaluate_params import gen_hyper, gen_hyper0
-from gen import get_model, SEED, get_limited_prompt, get_docs_tokens, get_relaxed_max_new_tokens
-from prompter import non_hf_types, PromptType, Prompter
+from gen import SEED, get_limited_prompt, get_relaxed_max_new_tokens, get_model_retry, gradio_to_llm, \
+    get_client_from_inference_server
+from prompter import non_hf_types, PromptType, Prompter, get_vllm_extra_dict, system_docqa, system_summary, \
+    is_vision_model, is_gradio_vision_model, is_json_model
 from src.serpapi import H2OSerpAPIWrapper
 from utils_langchain import StreamingGradioCallbackHandler, _chunk_sources, _add_meta, add_parser, fix_json_meta, \
-    load_general_summarization_chain
+    load_general_summarization_chain, H2OHuggingFaceHubEmbeddings
+
+# to check imports
+# find ./src -name '*.py' |  xargs awk '{ if (sub(/\\$/, "")) printf "%s ", $0; else print; }' |  grep 'from langchain\.' |  sed 's/^[ \t]*//' > go.py
+# python go.py
 
 import_matplotlib()
 
@@ -71,23 +98,24 @@ from langchain.chains.qa_with_sources import load_qa_with_sources_chain
 # , OutlookMessageLoader # GPL3
 # ImageCaptionLoader, # use our own wrapper
 #  ReadTheDocsLoader,  # no special file, some path, so have to give as special option
-from langchain.document_loaders import PyPDFLoader, TextLoader, CSVLoader, PythonLoader, TomlLoader, \
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader, PythonLoader, TomlLoader, \
     UnstructuredURLLoader, UnstructuredHTMLLoader, UnstructuredWordDocumentLoader, UnstructuredMarkdownLoader, \
     EverNoteLoader, UnstructuredEmailLoader, UnstructuredODTLoader, UnstructuredPowerPointLoader, \
     UnstructuredEPubLoader, UnstructuredImageLoader, UnstructuredRTFLoader, ArxivLoader, UnstructuredPDFLoader, \
-    UnstructuredExcelLoader, JSONLoader
-from langchain.text_splitter import Language, RecursiveCharacterTextSplitter, TextSplitter, CharacterTextSplitter
+    UnstructuredExcelLoader, JSONLoader, AsyncHtmlLoader, AsyncChromiumLoader
+from langchain.text_splitter import Language, RecursiveCharacterTextSplitter, TextSplitter
 from langchain.chains.question_answering import load_qa_chain
 from langchain.docstore.document import Document
 from langchain.prompts import PromptTemplate
-from langchain.llms import HuggingFaceTextGenInference, HuggingFacePipeline
-from langchain.vectorstores import Chroma
+from langchain_community.llms import HuggingFaceTextGenInference, HuggingFacePipeline
+from langchain_community.vectorstores import Chroma
 from chromamig import ChromaMig
 
 
-def split_list(input_list, split_size):
-    for i in range(0, len(input_list), split_size):
-        yield input_list[i:i + split_size]
+def get_context_cast():
+    # chroma not autocasting right internally
+    # return torch.autocast('cuda') if torch.cuda.is_available() else NullContext()
+    return NullContext()
 
 
 def get_db(sources, use_openai_embedding=False, db_type='faiss',
@@ -99,7 +127,8 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
            hf_embedding_model=None,
            migrate_embedding_model=False,
            auto_migrate_db=False,
-           n_jobs=-1):
+           n_jobs=-1,
+           verbose=False):
     if not sources:
         return None
     user_path = langchain_mode_paths.get(langchain_mode)
@@ -117,12 +146,12 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
 
     # Create vector database
     if db_type == 'faiss':
-        from langchain.vectorstores import FAISS
+        from langchain_community.vectorstores import FAISS
         db = FAISS.from_documents(sources, embedding)
     elif db_type == 'weaviate':
         import weaviate
         from weaviate.embedded import EmbeddedOptions
-        from langchain.vectorstores import Weaviate
+        from langchain_community.vectorstores import Weaviate
 
         if os.getenv('WEAVIATE_URL', None):
             client = _create_local_weaviate_client()
@@ -133,6 +162,18 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
         index_name = collection_name.capitalize()
         db = Weaviate.from_documents(documents=sources, embedding=embedding, client=client, by_text=False,
                                      index_name=index_name)
+    elif db_type == 'qdrant':
+        from langchain_community.vectorstores import Qdrant
+
+        qdrant_options = _get_qdrant_options()
+
+        if qdrant_options is not None:
+            db = Qdrant.from_documents(documents=sources, embedding=embedding, collection_name=collection_name,
+                                       **qdrant_options)
+        else:
+            db = Qdrant.from_documents(documents=sources, embedding=embedding, collection_name=collection_name,
+                                       location=":memory:")
+
     elif db_type in ['chroma', 'chroma_old']:
         assert persist_directory is not None
         # use_base already handled when making persist_directory, unless was passed into get_db()
@@ -172,10 +213,13 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
             if db_type == 'chroma':
                 import chromadb
                 api = chromadb.PersistentClient(path=persist_directory)
-                if hasattr(api._producer, 'max_batch_size'):
+                from_kwargs.update(dict(client=api))
+                if hasattr(api, 'max_batch_size'):
+                    max_batch_size = api.max_batch_size
+                elif hasattr(api, '_producer') and hasattr(api._producer, 'max_batch_size'):
                     max_batch_size = api._producer.max_batch_size
                 else:
-                    max_batch_size = 1000
+                    max_batch_size = int(os.getenv('CHROMA_MAX_BATCH_SIZE', '100'))
                 sources_batches = split_list(sources, max_batch_size)
                 for sources_batch in sources_batches:
                     db = Chroma.from_documents(documents=sources_batch, **from_kwargs)
@@ -189,7 +233,8 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
             # doesn't check or change embedding, just saves it in case not saved yet, after persisting
             db, num_new_sources, new_sources_metadata = add_to_db(db, sources, db_type=db_type,
                                                                   use_openai_embedding=use_openai_embedding,
-                                                                  hf_embedding_model=hf_embedding_model)
+                                                                  hf_embedding_model=hf_embedding_model,
+                                                                  verbose=verbose)
     else:
         raise RuntimeError("No such db_type=%s" % db_type)
 
@@ -212,34 +257,59 @@ def _get_unique_sources_in_weaviate(db):
 
 
 def del_from_db(db, sources, db_type=None):
+    if hasattr(db, '_persist_directory'):
+        print("Existing db, using %s" % db._persist_directory, flush=True)
+        # chroma only
+        lock_file = get_db_lock_file(db)
+        context = filelock.FileLock
+    else:
+        lock_file = None
+        context = NullContext
     if db_type in ['chroma', 'chroma_old'] and db is not None:
-        # sources should be list of x.metadata['source'] from document metadatas
-        if isinstance(sources, str):
-            sources = [sources]
-        else:
-            assert isinstance(sources, (list, tuple, types.GeneratorType))
-        metadatas = set(sources)
-        client_collection = db._client.get_collection(name=db._collection.name,
-                                                      embedding_function=db._collection._embedding_function)
-        for source in metadatas:
-            meta = dict(source=source)
-            try:
-                client_collection.delete(where=meta)
-            except KeyError:
-                pass
+        with context(lock_file):
+            # sources should be list of x.metadata['source'] from document metadatas
+            if isinstance(sources, str):
+                sources = [sources]
+            else:
+                assert isinstance(sources, (list, tuple, types.GeneratorType))
+            api = db._client
+            client_collection = api.get_collection(name=db._collection.name,
+                                                   embedding_function=db._collection._embedding_function)
+            if hasattr(api, 'max_batch_size'):
+                max_batch_size = api.max_batch_size
+            elif hasattr(client_collection, '_producer') and hasattr(client_collection._producer, 'max_batch_size'):
+                max_batch_size = client_collection._producer.max_batch_size
+            else:
+                max_batch_size = int(os.getenv('CHROMA_MAX_BATCH_SIZE', '100'))
+            metadatas = list(set(sources))
+            sources_batches = split_list(metadatas, max_batch_size)
+            for sources_batch in sources_batches:
+                for source in sources_batch:
+                    meta = dict(source=source)
+                    try:
+                        client_collection.delete(where=meta)
+                    except KeyError:
+                        pass
 
 
 def add_to_db(db, sources, db_type='faiss',
               avoid_dup_by_file=False,
               avoid_dup_by_content=True,
               use_openai_embedding=False,
-              hf_embedding_model=None):
+              hf_embedding_model=None,
+              verbose=False):
     assert hf_embedding_model is not None
     num_new_sources = len(sources)
     if not sources:
         return db, num_new_sources, []
+
+    # don't do too large a batch so uses reasonable amount of memory
+    max_max_batch_size = int(os.getenv('CHROMA_MAX_BATCH_SIZE', '4096'))
+
     if db_type == 'faiss':
-        db.add_documents(sources)
+        sources_batches = split_list(sources, max_max_batch_size)
+        for sources_batch in sources_batches:
+            db.add_documents(documents=sources_batch)
     elif db_type == 'weaviate':
         # FIXME: only control by file name, not hash yet
         if avoid_dup_by_file or avoid_dup_by_content:
@@ -248,7 +318,19 @@ def add_to_db(db, sources, db_type='faiss',
         num_new_sources = len(sources)
         if num_new_sources == 0:
             return db, num_new_sources, []
-        db.add_documents(documents=sources)
+        sources_batches = split_list(sources, max_max_batch_size)
+        for sources_batch in sources_batches:
+            db.add_documents(documents=sources_batch)
+    elif db_type == 'qdrant':
+        if avoid_dup_by_file or avoid_dup_by_content:
+            unique_sources = _get_unique_sources_in_qdrant(db)
+            sources = [x for x in sources if x.metadata['source'] not in unique_sources]
+        num_new_sources = len(sources)
+        if num_new_sources == 0:
+            return db, num_new_sources, []
+        sources_batches = split_list(sources, max_max_batch_size)
+        for sources_batch in sources_batches:
+            db.add_documents(documents=sources_batch)
     elif db_type in ['chroma', 'chroma_old']:
         collection = get_documents(db)
         # files we already have:
@@ -295,10 +377,16 @@ def add_to_db(db, sources, db_type='faiss',
             # else see RuntimeError: Index seems to be corrupted or unsupported
             import chromadb
             api = chromadb.PersistentClient(path=db._persist_directory)
-            if hasattr(api._producer, 'max_batch_size'):
+            if hasattr(api, 'max_batch_size'):
+                max_batch_size = api.max_batch_size
+            elif hasattr(api, '_producer') and hasattr(api._producer, 'max_batch_size'):
                 max_batch_size = api._producer.max_batch_size
             else:
-                max_batch_size = 1000
+                # be conservative if not set
+                max_batch_size = int(os.getenv('CHROMA_MAX_BATCH_SIZE', '100'))
+            max_batch_size = min(max_batch_size, max_max_batch_size)
+            if verbose:
+                print("max_batch_size=%s" % max_batch_size, flush=True)
             sources_batches = split_list(sources, max_batch_size)
             for sources_batch in sources_batches:
                 db.add_documents(documents=sources_batch)
@@ -342,6 +430,20 @@ def create_or_update_db(db_type, persist_directory, collection_name,
             client.schema.delete_class(index_name)
             if verbose:
                 print("Removing %s" % index_name, flush=True)
+    if db_type == 'qdrant':
+        from qdrant_client import QdrantClient
+
+        qdrant_options = _get_qdrant_options()
+
+        if qdrant_options is not None:
+            client = QdrantClient(**qdrant_options)
+        else:
+            client = QdrantClient(location=":memory:")
+
+        if client.collection_exists(collection_name):
+            client.delete_collection(collection_name)
+        if verbose:
+            print("Removing %s" % collection_name, flush=True)
     elif db_type in ['chroma', 'chroma_old']:
         pass
 
@@ -362,12 +464,14 @@ def create_or_update_db(db_type, persist_directory, collection_name,
                 hf_embedding_model=hf_embedding_model,
                 migrate_embedding_model=migrate_embedding_model,
                 auto_migrate_db=auto_migrate_db,
-                n_jobs=n_jobs)
+                n_jobs=n_jobs,
+                verbose=verbose,
+                )
 
     return db
 
 
-from langchain.embeddings import FakeEmbeddings
+from langchain_community.embeddings import FakeEmbeddings
 
 
 class H2OFakeEmbeddings(FakeEmbeddings):
@@ -386,12 +490,12 @@ class H2OFakeEmbeddings(FakeEmbeddings):
         return self._get_embedding()
 
 
-def get_embedding(use_openai_embedding, hf_embedding_model=None, preload=False):
+def get_embedding(use_openai_embedding, hf_embedding_model=None, preload=False, gpu_id=0):
     assert hf_embedding_model is not None
     # Get embedding model
     if use_openai_embedding:
         assert os.getenv("OPENAI_API_KEY") is not None, "Set ENV OPENAI_API_KEY"
-        from langchain.embeddings import OpenAIEmbeddings
+        from langchain_community.embeddings import OpenAIEmbeddings
         embedding = OpenAIEmbeddings(disallowed_special=())
     elif hf_embedding_model == 'fake':
         embedding = H2OFakeEmbeddings(size=1)
@@ -404,19 +508,41 @@ def get_embedding(use_openai_embedding, hf_embedding_model=None, preload=False):
         else:
             # object
             return hf_embedding_model
-        # to ensure can fork without deadlock
-        from langchain.embeddings import HuggingFaceEmbeddings
 
-        device, torch_dtype, context_class = get_device_dtype()
-        model_kwargs = dict(device=device)
-        if 'instructor' in hf_embedding_model:
-            encode_kwargs = {'normalize_embeddings': True}
-            embedding = HuggingFaceInstructEmbeddings(model_name=hf_embedding_model,
-                                                      model_kwargs=model_kwargs,
-                                                      encode_kwargs=encode_kwargs)
+        if hf_embedding_model.startswith('tei:'):
+            from langchain_community.embeddings import HuggingFaceHubEmbeddings
+            name = 'tei:'.join(hf_embedding_model.split('tei:')[1:])
+            embedding = H2OHuggingFaceHubEmbeddings(model=name,
+                                                    huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN"),
+                                                    model_kwargs={"truncate": True})
         else:
-            embedding = HuggingFaceEmbeddings(model_name=hf_embedding_model, model_kwargs=model_kwargs)
-        embedding.client.preload = preload
+            # to ensure can fork without deadlock
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+
+            if isinstance(gpu_id, int) or gpu_id == 'auto':
+                device, torch_dtype, context_class = get_device_dtype()
+                model_kwargs = dict(device=device)
+            else:
+                # use gpu_id as device name
+                model_kwargs = dict(device=gpu_id)
+            if 'instructor' in hf_embedding_model:
+                encode_kwargs = {'normalize_embeddings': True}
+                embedding = HuggingFaceInstructEmbeddings(model_name=hf_embedding_model,
+                                                          model_kwargs=model_kwargs,
+                                                          encode_kwargs=encode_kwargs)
+                embedding.client.eval()
+            else:
+                embedding = HuggingFaceEmbeddings(model_name=hf_embedding_model, model_kwargs=model_kwargs)
+                embedding.client.eval()
+            if gpu_id == 'auto':
+                gpu_id = 0
+            if preload and \
+                    isinstance(gpu_id, int) and \
+                    gpu_id >= 0 and \
+                    hasattr(embedding.client, 'to') and \
+                    get_device() == 'cuda':
+                embedding.client = embedding.client.to('cuda:%d' % gpu_id)
+            embedding.client.preload = preload
     return embedding
 
 
@@ -432,9 +558,9 @@ def get_answer_from_sources(chain, sources, question):
 
 """Wrapper around Huggingface text generation inference API."""
 from functools import partial
-from typing import Any, Dict, List, Optional, Set, Iterable
+from typing import Any, Dict, List, Optional, Iterable
 
-from pydantic import Extra, Field, root_validator
+from pydantic import Field
 
 from langchain.callbacks.manager import CallbackManagerForLLMRun, AsyncCallbackManagerForLLMRun
 from langchain.llms.base import LLM
@@ -453,7 +579,8 @@ class H2Oagenerate:
             print("_agenerate H2O", flush=True)
         generations = []
         new_arg_supported = inspect.signature(self._acall).parameters.get("run_manager")
-        self.count_input_tokens += sum([self.get_num_tokens(prompt) for prompt in prompts])
+        self.count_input_tokens += sum([self.get_num_tokens(str(prompt)) for prompt in prompts])
+        self.prompts.extend(prompts)
         tasks = [
             asyncio.ensure_future(self._agenerate_one(prompt, stop=stop, run_manager=run_manager,
                                                       new_arg_supported=new_arg_supported, **kwargs))
@@ -500,6 +627,7 @@ class GradioInference(H2Oagenerate, LLM):
     repetition_penalty: Optional[float] = None
     num_return_sequences: Optional[int] = 1
     do_sample: bool = False
+    seed: int = 0
     chat_client: bool = False
 
     return_full_text: bool = False
@@ -512,21 +640,32 @@ class GradioInference(H2Oagenerate, LLM):
     client: Any = None
     tokenizer: Any = None
 
+    chat_conversation: Any = []
+    add_chat_history_to_context: bool = True
+
     system_prompt: Any = None
     visible_models: Any = None
     h2ogpt_key: Any = None
 
+    image_file: Any = None
+    image_control: Any = None
+
+    response_format: Any = None
+    guided_json: Any = None
+    guided_regex: Any = None
+    guided_choice: Any = None
+    guided_grammar: Any = None
+
     async_sem: Any = None
     count_input_tokens: Any = 0
+    prompts: Any = []
     count_output_tokens: Any = 0
 
-    min_max_new_tokens: Any = 256
+    min_max_new_tokens: Any = 512
     max_input_tokens: Any = -1
+    max_total_input_tokens: Any = -1
 
-    class Config:
-        """Configuration for this pydantic object."""
-
-        extra = Extra.forbid
+    doing_grounding: bool = False
 
     @root_validator()
     def validate_environment(cls, values: Dict) -> Dict:
@@ -556,22 +695,37 @@ class GradioInference(H2Oagenerate, LLM):
         # This is good, so gradio server can also handle stopping.py conditions
         # this is different than TGI server that uses prompter to inject prompt_type prompting
         stream_output = self.stream_output
+        # don't double-up langchain behavior, already did langchain part
         client_langchain_mode = 'Disabled'
-        client_add_chat_history_to_context = True
+        client_add_chat_history_to_context = self.add_chat_history_to_context
+        # already did search part
         client_add_search_to_context = False
-        client_chat_conversation = []
+        # didn't do conversation part yet
+        client_chat_conversation = self.chat_conversation
         client_langchain_action = LangChainAction.QUERY.value
         client_langchain_agents = []
         top_k_docs = 1
         chunk = True
         chunk_size = 512
+
+        prompt_type = self.prompter.prompt_type
+        if self.doing_grounding:
+            # avoid double prompting from grounded then normal template
+            prompt_type = noop_prompt_type
+            # already did conversation as part of prompt
+            client_chat_conversation = []
+            self.context = ''
+            self.iinput = ''
+            self.system_prompt = ''
+
         client_kwargs = dict(instruction=prompt if self.chat_client else '',  # only for chat=True
                              iinput=self.iinput if self.chat_client else '',  # only for chat=True
+                             # context shouldn't include conversation!
                              context=self.context,
                              # streaming output is supported, loops over and outputs each generation in streaming mode
                              # but leave stream_output=False for simple input/output mode
                              stream_output=stream_output,
-                             prompt_type=self.prompter.prompt_type,
+                             prompt_type=prompt_type,
                              prompt_dict='',
 
                              temperature=self.temperature,
@@ -586,6 +740,7 @@ class GradioInference(H2Oagenerate, LLM):
                              repetition_penalty=self.repetition_penalty,
                              num_return_sequences=self.num_return_sequences,
                              do_sample=self.do_sample,
+                             seed=self.seed,
                              chat=self.chat_client,
 
                              instruction_nochat=prompt if not self.chat_client else '',
@@ -599,15 +754,22 @@ class GradioInference(H2Oagenerate, LLM):
                              chunk_size=chunk_size,
                              document_subset=DocumentSubset.Relevant.name,
                              document_choice=[DocumentChoice.ALL.value],
+                             document_source_substrings=[],
+                             document_source_substrings_op='and',
+                             document_content_substrings=[],
+                             document_content_substrings_op='and',
                              pre_prompt_query=None,
                              prompt_query=None,
                              pre_prompt_summary=None,
                              prompt_summary=None,
+                             hyde_llm_prompt=None,
                              system_prompt=self.system_prompt,
-                             image_loaders=None,  # don't need to further do doc specific things
+                             image_audio_loaders=None,  # don't need to further do doc specific things
                              pdf_loaders=None,  # don't need to further do doc specific things
                              url_loaders=None,  # don't need to further do doc specific things
                              jq_schema=None,  # don't need to further do doc specific things
+                             extract_frames=10,
+                             llava_prompt=None,
                              visible_models=self.visible_models,
                              h2ogpt_key=self.h2ogpt_key,
                              add_search_to_context=client_add_search_to_context,
@@ -616,13 +778,28 @@ class GradioInference(H2Oagenerate, LLM):
                              docs_ordering_type=None,
                              min_max_new_tokens=self.min_max_new_tokens,
                              max_input_tokens=self.max_input_tokens,
+                             max_total_input_tokens=self.max_total_input_tokens,
                              docs_token_handling=None,
                              docs_joiner=None,
                              hyde_level=None,
                              hyde_template=None,
+                             hyde_show_only_final=None,
+                             doc_json_mode=None,
+                             metadata_in_context=None,
+
+                             image_file=self.image_file,
+                             image_control=self.image_control,
+
+                             response_format=self.response_format,
+                             guided_json=self.guided_json,
+                             guided_regex=self.guided_regex,
+                             guided_choice=self.guided_choice,
+                             guided_grammar=self.guided_grammar,
                              )
         api_name = '/submit_nochat_api'  # NOTE: like submit_nochat but stable API for string dict passing
-        self.count_input_tokens += self.get_num_tokens(prompt)
+        # let inner gradio count input tokens
+        # self.count_input_tokens += self.get_num_tokens(str(prompt))
+        # self.prompts.append(prompt)
 
         return client_kwargs, api_name
 
@@ -640,12 +817,13 @@ class GradioInference(H2Oagenerate, LLM):
         max_new_tokens = get_relaxed_max_new_tokens(prompt, tokenizer=self.tokenizer,
                                                     max_new_tokens=self.max_new_tokens,
                                                     max_new_tokens0=self.max_new_tokens0)
-        client_kwargs.update(dict(max_new_tokens=get_relaxed_max_new_tokens(max_new_tokens)))
+        client_kwargs.update(dict(max_new_tokens=max_new_tokens))
 
         # new client for each call
         client = self.client.clone()
         from gradio_utils.grclient import check_job
 
+        res_dict = {}
         if not self.stream_output:
             res = client.predict(str(dict(client_kwargs)), api_name=api_name)
             res_dict = ast.literal_eval(res)
@@ -655,6 +833,12 @@ class GradioInference(H2Oagenerate, LLM):
             self.count_output_tokens += self.get_num_tokens(ret)
             if self.verbose:
                 print("end _call", flush=True)
+            self.use_gradio_return(res_dict, prompt)
+
+            # ensure parent client is updated if remote server changed
+            if client.server_hash != self.client.server_hash:
+                self.client.refresh_client()
+
             return ret
         else:
             text_callback = None
@@ -665,15 +849,20 @@ class GradioInference(H2Oagenerate, LLM):
 
             job = client.submit(str(dict(client_kwargs)), api_name=api_name)
             text0 = ''
+            t_start = time.time()
             while not job.done():
                 if job.communicator.job.latest_status.code.name == 'FINISHED':
                     break
                 e = check_job(job, timeout=0, raise_exception=False)
                 if e is not None:
                     break
-                outputs_list = job.communicator.job.outputs
+                if self.max_time is not None and time.time() - t_start > self.max_time:
+                    if self.verbose:
+                        print("Exceeded max_time=%s" % self.max_time, flush=True)
+                    break
+                outputs_list = job.outputs().copy()
                 if outputs_list:
-                    res = job.communicator.job.outputs[-1]
+                    res = outputs_list[-1]
                     res_dict = ast.literal_eval(res)
                     text = res_dict['response']
                     text = self.prompter.get_response(prompt + text, prompt=prompt,
@@ -693,12 +882,14 @@ class GradioInference(H2Oagenerate, LLM):
                 time.sleep(0.01)
 
             # ensure get last output to avoid race
-            res_all = job.outputs()
+            res_all = job.outputs().copy()
+            success = job.communicator.job.latest_status.success
+            timeout = 0.1 if success else 10
             if len(res_all) > 0:
                 # don't raise unless nochat API for now
-                # set below to True for now, not not self.chat_client, since not handling exception otherwise
+                # set below to True for now, not self.chat_client, since not handling exception otherwise
                 # in some return of strex
-                check_job(job, timeout=0.02, raise_exception=True)
+                check_job(job, timeout=timeout, raise_exception=True)
 
                 res = res_all[-1]
                 res_dict = ast.literal_eval(res)
@@ -707,7 +898,7 @@ class GradioInference(H2Oagenerate, LLM):
             else:
                 # if got no answer at all, probably something bad, always raise exception
                 # UI will still put exception in Chat History under chat exceptions
-                check_job(job, timeout=0.3, raise_exception=True)
+                check_job(job, timeout=timeout, raise_exception=True)
                 # go with old if failure
                 text = text0
             text_chunk = text[len(text0):]
@@ -718,7 +909,20 @@ class GradioInference(H2Oagenerate, LLM):
             self.count_output_tokens += self.get_num_tokens(ret)
             if self.verbose:
                 print("end _call", flush=True)
+            self.use_gradio_return(res_dict, prompt)
+
+            # ensure parent client is updated if remote server changed
+            if client.server_hash != self.client.server_hash:
+                with filelock.FileLock(os.path.join('locks', 'gradio_client.lock')):
+                    self.client.refresh_client()
+
             return ret
+
+    def use_gradio_return(self, res_dict, prompt_raw):
+        self.count_input_tokens += res_dict.get('save_dict', {}).get('extra_dict', {}).get('num_prompt_tokens',
+                                                                                           self.get_num_tokens(
+                                                                                               str(prompt_raw)))
+        self.prompts.append(res_dict.get('prompt_raw', prompt_raw))
 
     # copy-paste of streaming part of _call() with asyncio.sleep instead
     async def _acall(
@@ -740,6 +944,9 @@ class GradioInference(H2Oagenerate, LLM):
             )
         # new client for each acall
         client = self.client.clone()
+        from gradio_utils.grclient import check_job
+
+        t_start = time.time()
         job = client.submit(str(dict(client_kwargs)), api_name=api_name)
         text0 = ''
         while not job.done():
@@ -748,9 +955,9 @@ class GradioInference(H2Oagenerate, LLM):
             e = job.future._exception
             if e is not None:
                 break
-            outputs_list = job.communicator.job.outputs
+            outputs_list = job.outputs().copy()
             if outputs_list:
-                res = job.communicator.job.outputs[-1]
+                res = outputs_list[-1]
                 res_dict = ast.literal_eval(res)
                 text = res_dict['response']
                 text = self.prompter.get_response(prompt + text, prompt=prompt,
@@ -767,18 +974,28 @@ class GradioInference(H2Oagenerate, LLM):
                 if text_callback:
                     await text_callback(text_chunk)
 
+            if self.max_time is not None and time.time() - t_start > self.max_time:
+                if self.verbose:
+                    print("Exceeded max_time=%s" % self.max_time, flush=True)
+                break
+
             await asyncio.sleep(0.01)
 
         # ensure get last output to avoid race
-        res_all = job.outputs()
+        res_all = job.outputs().copy()
+        success = job.communicator.job.latest_status.success
+        timeout = 0.1 if success else 10
         if len(res_all) > 0:
             res = res_all[-1]
             res_dict = ast.literal_eval(res)
             text = res_dict['response']
             # FIXME: derive chunk from full for now
+            check_job(job, timeout=timeout, raise_exception=True)
         else:
             # go with old if failure
             text = text0
+            check_job(job, timeout=timeout, raise_exception=True)
+
         text_chunk = text[len(text0):]
         if text_callback:
             await text_callback(text_chunk)
@@ -795,14 +1012,193 @@ class GradioInference(H2Oagenerate, LLM):
         # return _get_token_ids_default_method(text)
 
 
+class GradioLLaVaInference(GradioInference):
+    """
+    Gradio/LLaVa generation inference API.
+    """
+    image_file: Any = None
+
+    @root_validator()
+    def validate_environment(cls, values: Dict) -> Dict:
+        """Validate that python package exists in environment."""
+
+        try:
+            if values['client'] is None:
+                from gradio_utils.grclient import GradioClient
+                values["client"] = GradioClient(
+                    values["inference_server_url"], check_hash=False, serialize=True,
+                )
+        except ImportError:
+            raise ImportError(
+                "Could not import gradio_client python package. "
+                "Please install it with `pip install gradio_client`."
+            )
+        return values
+
+    @property
+    def _llm_type(self) -> str:
+        """Return type of llm."""
+        return "gradio_llava_inference"
+
+    def setup_call(self, prompt):
+
+        stream_output = self.stream_output
+        client_kwargs = dict(instruction=prompt,
+                             stream_output=stream_output,
+                             prompt_type=self.prompter.prompt_type,
+                             prompt_dict='',
+
+                             temperature=self.temperature,
+                             top_p=self.top_p,
+                             top_k=self.top_k,
+                             penalty_alpha=self.penalty_alpha,
+                             max_new_tokens=self.max_new_tokens,
+                             min_max_new_tokens=self.min_max_new_tokens,
+                             min_new_tokens=self.min_new_tokens,
+                             verbose=self.verbose,
+                             )
+        # NOTE: Don't handle self.context
+        if not self.add_chat_history_to_context:
+            self.chat_conversation = []
+
+        if self.image_file is not None:
+            self.image_file = self.image_file[:llava_num_max]
+            self.count_input_tokens += 1500 * len(self.image_file)
+        self.count_input_tokens += self.get_num_tokens(str(prompt))
+        self.prompts.append(prompt)
+
+        llava_kwargs = dict(file=self.image_file,
+                            llava_model=self.inference_server_url,
+                            # prompt=instruction,
+                            prompt=prompt,  # prepared prompt with chat history etc.
+                            chat_conversation=self.chat_conversation,
+                            allow_prompt_auto=False,
+                            image_model=self.visible_models,
+                            temperature=client_kwargs['temperature'],
+                            top_p=client_kwargs['top_p'],
+                            max_new_tokens=client_kwargs['max_new_tokens'],
+                            client=self.client,
+                            max_time=self.max_time,
+                            tokenizer=self.tokenizer,
+                            )
+        max_new_tokens = get_relaxed_max_new_tokens(prompt, tokenizer=self.tokenizer,
+                                                    max_new_tokens=self.max_new_tokens,
+                                                    max_new_tokens0=self.max_new_tokens0)
+        client_kwargs.update(dict(max_new_tokens=get_relaxed_max_new_tokens(max_new_tokens)))
+
+        return client_kwargs, llava_kwargs
+
+    def _call(
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+    ) -> str:
+        if self.verbose:
+            print("_call", flush=True)
+
+        _, llava_kwargs = self.setup_call(prompt)
+
+        if not self.stream_output:
+            from src.vision.utils_vision import get_llava_response
+            response, _ = get_llava_response(**llava_kwargs)
+            self.count_output_tokens += self.get_num_tokens(response)
+            if self.verbose:
+                print("end _call", flush=True)
+            return response
+        else:
+            text_callback = None
+            if run_manager:
+                text_callback = partial(
+                    run_manager.on_llm_new_token, verbose=self.verbose
+                )
+
+            t_start = time.time()
+            text0 = ''
+            text = ''
+            from src.vision.utils_vision import get_llava_stream
+            for text in get_llava_stream(**llava_kwargs):
+
+                # FIXME: derive chunk from full for now
+                text_chunk = text[len(text0):]
+                if not text_chunk:
+                    # just need some sleep for threads to switch
+                    time.sleep(0.001)
+                    continue
+                # save old
+                text0 = text
+                if text_callback:
+                    text_callback(text_chunk)
+                time.sleep(0.01)
+
+                if self.max_time is not None and time.time() - t_start > self.max_time:
+                    if self.verbose:
+                        print("Exceeded max_time=%s" % self.max_time, flush=True)
+                    break
+
+            self.count_output_tokens += self.get_num_tokens(text)
+            if self.verbose:
+                print("end _call", flush=True)
+            return text
+
+    # copy-paste of streaming part of _call() with asyncio.sleep instead
+    async def _acall(
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+    ) -> str:
+        if self.verbose:
+            print("_acall", flush=True)
+
+        _, llava_kwargs = self.setup_call(prompt)
+
+        text_callback = None
+        if run_manager:
+            text_callback = partial(
+                run_manager.on_llm_new_token, verbose=self.verbose
+            )
+
+        t_start = time.time()
+        text0 = ''
+        text = ''
+        from src.vision.utils_vision import get_llava_stream
+        for text in get_llava_stream(**llava_kwargs):
+
+            # FIXME: derive chunk from full for now
+            text_chunk = text[len(text0):]
+            if not text_chunk:
+                # just need some sleep for threads to switch
+                await asyncio.sleep(0.001)
+                continue
+            # save old
+            text0 = text
+            if text_callback:
+                await text_callback(text_chunk)
+
+            if self.max_time is not None and time.time() - t_start > self.max_time:
+                if self.verbose:
+                    print("Exceeded max_time=%s" % self.max_time, flush=True)
+                break
+            await asyncio.sleep(0.01)
+
+        self.count_output_tokens += self.get_num_tokens(text)
+        if self.verbose:
+            print("end _acall", flush=True)
+        return text
+
+
 class H2OHuggingFaceTextGenInference(H2Oagenerate, HuggingFaceTextGenInference):
     max_new_tokens: int = 512
     do_sample: bool = False
-    top_p: Optional[float] = 0.95
+    seed: int = 0
+    top_p: Optional[float] = 0.99
     top_k: Optional[int] = None
     penalty_alpha: Optional[float] = 0.0
     typical_p: Optional[float] = 0.95
-    temperature: float = 0.8
+    temperature: float = 0.0
     repetition_penalty: Optional[float] = None
     return_full_text: bool = False
     stop_sequences: List[str] = Field(default_factory=list)
@@ -818,6 +1214,7 @@ class H2OHuggingFaceTextGenInference(H2Oagenerate, HuggingFaceTextGenInference):
     tokenizer: Any = None
     async_sem: Any = None
     count_input_tokens: Any = 0
+    prompts: Any = []
     count_output_tokens: Any = 0
 
     def _call(
@@ -843,9 +1240,11 @@ class H2OHuggingFaceTextGenInference(H2Oagenerate, HuggingFaceTextGenInference):
         # NOTE: TGI server does not add prompting, so must do here
         data_point = dict(context=self.context, instruction=prompt, input=self.iinput)
         prompt = self.prompter.generate_prompt(data_point)
-        self.count_input_tokens += self.get_num_tokens(prompt)
+        self.count_input_tokens += self.get_num_tokens(str(prompt))
+        self.prompts.append(prompt)
 
         gen_server_kwargs = dict(do_sample=self.do_sample,
+                                 seed=self.seed,
                                  stop_sequences=stop,
                                  max_new_tokens=self.max_new_tokens,
                                  top_p=self.top_p,
@@ -855,7 +1254,6 @@ class H2OHuggingFaceTextGenInference(H2Oagenerate, HuggingFaceTextGenInference):
                                  temperature=self.temperature,
                                  repetition_penalty=self.repetition_penalty,
                                  return_full_text=self.return_full_text,
-                                 seed=self.seed,
                                  )
         gen_server_kwargs.update(kwargs)
 
@@ -950,8 +1348,10 @@ class H2OHuggingFaceTextGenInference(H2Oagenerate, HuggingFaceTextGenInference):
         # return _get_token_ids_default_method(text)
 
 
-from langchain.chat_models import ChatOpenAI, AzureChatOpenAI
-from langchain.llms import OpenAI, AzureOpenAI, Replicate
+from langchain_community.chat_models import ChatOpenAI, AzureChatOpenAI
+from langchain_community.chat_models import ChatAnthropic as ChatAnthropic2
+from langchain_anthropic import ChatAnthropic as ChatAnthropic3
+from langchain_community.llms import OpenAI, AzureOpenAI, Replicate
 
 
 class H2OOpenAI(OpenAI):
@@ -970,8 +1370,10 @@ class H2OOpenAI(OpenAI):
     tokenizer: Any = None
     async_sem: Any = None
     count_input_tokens: Any = 0
+    prompts: Any = []
     count_output_tokens: Any = 0
     max_new_tokens0: Any = None
+    count_llm_calls: Any = 0
 
     def update_prompts_and_stops(self, prompts, stop, **kwargs):
         stop_tmp = self.stop_sequences if not stop else self.stop_sequences + stop
@@ -989,7 +1391,6 @@ class H2OOpenAI(OpenAI):
             prompts[prompti] = prompt
 
         kwargs = self.update_kwargs(prompts, kwargs)
-
         return prompts, stop, kwargs
 
     def update_kwargs(self, prompts, kwargs):
@@ -1004,11 +1405,35 @@ class H2OOpenAI(OpenAI):
 
     def max_tokens_for_prompt(self, prompt: str) -> int:
         # like super() OpenAI version but added limit
-        num_tokens = self.get_num_tokens(prompt)
+        num_tokens = self.get_num_tokens(str(prompt))
         if self.max_new_tokens0 is not None:
-            return min(self.max_new_tokens0, self.tokenizer.model_max_length - num_tokens)
+            return max(128, min(self.max_new_tokens0, self.tokenizer.model_max_length - num_tokens))
         else:
-            return self.max_context_size - num_tokens
+            return max(128, self.max_context_size - num_tokens)
+
+    def count_out_tokens(self, rets):
+        try:
+            self.count_output_tokens += sum(
+                [self.get_num_tokens(z) for z in flatten_list([[x.text for x in y] for y in rets.generations])])
+        except Exception as e:
+            if os.getenv('HARD_ASSERTS'):
+                raise
+            print("Failed to get total output tokens\n%s\n" % traceback.format_exc())
+
+    def collect_llm_results(self, rets):
+        generations = [x.generations[0] for x in rets]
+
+        def reducer(accumulator, element):
+            for key, value in element.items():
+                accumulator[key] = accumulator.get(key, 0) + value
+            return accumulator
+
+        collection = [x.llm_output['token_usage'] for x in rets]
+        token_usage = reduce(reducer, collection, {})
+
+        llm_output = {"token_usage": token_usage, "model_name": self.model_name}
+        self.count_output_tokens += token_usage.get('completion_tokens', 0)
+        return LLMResult(generations=generations, llm_output=llm_output)
 
     def _generate(
             self,
@@ -1020,7 +1445,34 @@ class H2OOpenAI(OpenAI):
         if self.verbose:
             print("Hit _generate", flush=True)
         prompts, stop, kwargs = self.update_prompts_and_stops(prompts, stop, **kwargs)
-        return super()._generate(prompts, stop=stop, run_manager=run_manager, **kwargs)
+        self.count_input_tokens += sum([self.get_num_tokens(str(prompt)) for prompt in prompts])
+        self.count_llm_calls += len(prompts)
+        self.prompts.extend(prompts)
+        if self.batch_size > 1:
+            rets = super()._generate(prompts, stop=stop, run_manager=run_manager, **kwargs)
+            self.count_out_tokens(rets)
+        else:
+            rets = []
+            for sub_prompt in prompts:
+                rets1 = super()._generate([sub_prompt], stop=stop, run_manager=run_manager, **kwargs)
+                rets.append(rets1)
+            rets = self.collect_llm_results(rets)  # counts output tokens already
+
+        # handle fact that multi-character stops will only stop streaming once last matching character, then we get rest
+        if stop is None:
+            stop = []
+        all_stops = stop.copy() if stop is not None else []
+        for stop_seq in all_stops:
+            if len(stop_seq) > 6:
+                stop.append(stop_seq[:6])
+
+        for gens in rets.generations:
+            for genobj in gens:
+                gen_text = genobj.text
+                for stop_seq in stop:
+                    if stop_seq in gen_text:
+                        genobj.text = gen_text[:gen_text.index(stop_seq)]
+        return rets
 
     def _stream(
             self,
@@ -1050,27 +1502,19 @@ class H2OOpenAI(OpenAI):
             **kwargs: Any,
     ) -> LLMResult:
         prompts, stop, kwargs = self.update_prompts_and_stops(prompts, stop, **kwargs)
+        self.count_input_tokens += sum([self.get_num_tokens(str(prompt)) for prompt in prompts])
+        self.count_llm_calls += len(prompts)
         if self.batch_size > 1 or self.streaming:
-            return await super()._agenerate(prompts, stop=stop, run_manager=run_manager, **kwargs)
+            rets = await super()._agenerate(prompts, stop=stop, run_manager=run_manager, **kwargs)
+            self.count_out_tokens(rets)
+            return rets
         else:
-            self.count_input_tokens += sum([self.get_num_tokens(prompt) for prompt in prompts])
+            self.prompts.extend(prompts)
             tasks = [
                 asyncio.ensure_future(self._agenerate_one(prompt, stop=stop, run_manager=run_manager, **kwargs))
                 for prompt in prompts]
             llm_results = await asyncio.gather(*tasks)
-            generations = [x.generations[0] for x in llm_results]
-
-            def reducer(accumulator, element):
-                for key, value in element.items():
-                    accumulator[key] = accumulator.get(key, 0) + value
-                return accumulator
-
-            collection = [x.llm_output['token_usage'] for x in llm_results]
-            token_usage = reduce(reducer, collection, {})
-
-            llm_output = {"token_usage": token_usage, "model_name": self.model_name}
-            self.count_output_tokens += token_usage.get('completion_tokens', 0)
-            return LLMResult(generations=generations, llm_output=llm_output)
+            return self.collect_llm_results(llm_results)
 
     async def _agenerate_one(
             self,
@@ -1101,6 +1545,7 @@ class H2OReplicate(Replicate):
     context: Any = ''
     iinput: Any = ''
     tokenizer: Any = None
+    prompts: Any = []
 
     def _call(
             self,
@@ -1135,28 +1580,296 @@ class ExtraChat:
     def get_messages(self, prompts):
         from langchain.schema import AIMessage, SystemMessage, HumanMessage
         messages = []
+        count_input_tokens_start = self.count_input_tokens
         if self.system_prompt:
-            messages.append(SystemMessage(content=self.system_prompt))
+            if isinstance(self, (H2OChatAnthropic2, H2OChatGoogle)) and not isinstance(self, H2OChatAnthropic2Sys):
+                self.chat_conversation = [[user_prompt_for_fake_system_prompt,
+                                           self.system_prompt]] + self.chat_conversation
+            else:
+                self.count_input_tokens += self.get_num_tokens(str(self.system_prompt))
+                messages.append(SystemMessage(content=self.system_prompt))
+        img_base64 = None
+        img_tag = None
         if self.chat_conversation:
             for messages1 in self.chat_conversation:
-                messages.append(HumanMessage(content=messages1[0] if messages1[0] is not None else ''))
-                messages.append(AIMessage(content=messages1[1] if messages1[1] is not None else ''))
+                if len(messages1) != 2:
+                    continue
+                if len(messages1) == 2 and (messages1[0] is None or messages1[1] is None):
+                    # then not really part of LLM, internal, so avoid
+                    continue
+                if messages1[1] in [claude3imagetag, gpt4imagetag, geminiimagetag]:
+                    img_tag = messages1[1]
+                    img_base64 = messages1[0]
+                    continue
+                if messages1[0]:
+                    instruction = gradio_to_llm(messages1[0], bot=False)
+                    messages.append(HumanMessage(content=instruction))
+                    self.count_input_tokens += self.get_num_tokens(str(instruction))
+                if messages1[1]:
+                    output = gradio_to_llm(messages1[1], bot=True)
+                    messages.append(AIMessage(content=output))
+                    self.count_input_tokens += self.get_num_tokens(str(output))
+        if isinstance(self, H2OChatGoogle) and img_base64 is not None:
+            # Multiturn chat is not enabled for models/gemini-pro-vision
+            messages = []
+            self.count_input_tokens = count_input_tokens_start
         prompt_messages = []
         for prompt in prompts:
             if isinstance(prompt, ChatPromptValue):
                 prompt_message = messages + prompt.messages
+                assert img_base64 is None, "img_base64 was filled, unused"
             else:
-                prompt_message = HumanMessage(content=prompt.text if prompt.text is not None else '')
+                prompt_text = prompt.text if prompt.text is not None else ''
+                if img_base64:
+                    if isinstance(img_base64, str):
+                        img_base64 = [img_base64]
+                    assert isinstance(img_base64, list)
+                    # https://docs.anthropic.com/claude/docs/vision
+                    # https://python.langchain.com/docs/integrations/chat/anthropic
+                    # could also be type "image" and add "source" with other details
+                    # also valid for gpt-4-vision: https://community.openai.com/t/using-gpt-4-vision-preview-in-langchain/549393
+                    # https://python.langchain.com/docs/integrations/chat/google_generative_ai
+                    # https://github.com/GoogleCloudPlatform/generative-ai/blob/main/gemini/getting-started/intro_gemini_pro_vision_python.ipynb
+                    content = []
+                    num_images = 0
+                    for img_base64_one in img_base64:
+                        if img_tag in [geminiimagetag]:
+                            img_url = img_base64_one
+                        else:
+                            img_url = {
+                                "url": img_base64_one,
+                            }
+                            # https://platform.openai.com/docs/guides/vision
+                            if img_tag in [gpt4imagetag]:
+                                img_url['detail'] = 'high'
+                        content.append({
+                            "type": "image_url",
+                            "image_url": img_url,
+                        })
+
+                        # estimate cost, assuming usually use about 1kx1k
+                        if img_tag in [claude3imagetag]:
+                            # https://docs.anthropic.com/claude/docs/vision#image-costs
+                            # for roughly 1kx1k image
+                            self.count_input_tokens += claude3_image_tokens
+                        if img_tag in [geminiimagetag]:
+                            # https://cloud.google.com/vertex-ai/generative-ai/pricing
+                            # gemini gives $ cost per image, not by tokens, just estimate
+                            # $0.0025 per image and $0.000125/1k tokens, 4 chars/token, so image like 20k chars or 5k tokens
+                            self.count_input_tokens += gemini_image_tokens
+                        if img_tag in [gpt4imagetag]:
+                            # https://openai.com/pricing
+                            # for 1kx1k costs $0.00765 while $10/M tokens, so image is like 765 tokens
+                            self.count_input_tokens += gpt4_image_tokens
+
+                        num_images += 1
+                        if img_tag in [geminiimagetag] and num_images >= geminiimage_num_max:
+                            break
+                        if img_tag in [gpt4imagetag] and num_images >= gpt4image_num_max:
+                            break
+                        if img_tag in [claude3imagetag] and num_images >= claude3image_num_max:
+                            break
+                    # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/design-multimodal-prompts
+                    # gemini recommends images come first before text
+                    content.append({"type": "text", "text": prompt_text})
+                    self.count_input_tokens += self.get_num_tokens(str(prompt_text))
+                else:
+                    content = prompt_text
+                    self.count_input_tokens += self.get_num_tokens(str(prompt_text))
+                prompt_message = HumanMessage(content=content)
                 prompt_message = messages + [prompt_message]
             prompt_messages.append(prompt_message)
+        if self.verbose:
+            print('count_input_tokens for %s: %s' % (str(self.__class__.__name__), self.count_input_tokens), flush=True)
         return prompt_messages
 
 
-class H2OChatOpenAI(ChatOpenAI, ExtraChat):
+class GenerateStream:
+    def generate_prompt(
+            self,
+            prompts: List[PromptValue],
+            stop: Optional[List[str]] = None,
+            callbacks: Callbacks = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        self.prompts.extend(prompts)
+        prompt_messages = self.get_messages(prompts)
+        if 'streaming' not in kwargs:
+            kwargs['streaming'] = self.streaming
+        # prompt_messages = [p.to_messages() for p in prompts]
+        return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+
+    async def agenerate_prompt(
+            self,
+            prompts: List[PromptValue],
+            stop: Optional[List[str]] = None,
+            callbacks: Callbacks = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        self.prompts.extend(prompts)
+        prompt_messages = self.get_messages(prompts)
+        # prompt_messages = [p.to_messages() for p in prompts]
+        if 'streaming' not in kwargs:
+            kwargs['streaming'] = self.streaming
+        return await self.agenerate(
+            prompt_messages, stop=stop, callbacks=callbacks, **kwargs
+        )
+
+    def _generate(
+            self,
+            messages: List[BaseMessage],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            stream: Optional[bool] = None,
+            **kwargs: Any,
+    ) -> ChatResult:
+        should_stream = stream if stream is not None else self.streaming
+        have_tool = False
+        if hasattr(self, 'model_kwargs') and 'tools' in self.model_kwargs:
+            should_stream = False
+            have_tool = True
+        kwargs.pop('stream', None)
+        kwargs.pop('streaming', None)
+        if should_stream:
+            stream_iter = self._stream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            return generate_from_stream(stream_iter)
+        else:
+            ret = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            return self.tool_string_return(ret, have_tool)
+
+    def tool_string_return(self, ret, have_tool):
+        if have_tool and isinstance(ret.generations[0].text, list):
+            # overwrite
+            if not ret.generations[0].text:
+                ret.generations[0].text = json.dumps({})
+            else:
+                # -1 is last, to skip first thinking step for opus/sonnet
+                # bug in claude with sonnet:
+                result = ret.generations[0].text[-1]['input']
+                if isinstance(result, dict) and len(result) == 1 and 'properties' in result:
+                    result = result['properties']
+                ret.generations[0].text = json.dumps(result)
+        return ret
+
+    async def _agenerate(
+            self,
+            messages: List[BaseMessage],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+            stream: Optional[bool] = None,
+            **kwargs: Any,
+    ) -> ChatResult:
+        should_stream = stream if stream is not None else self.streaming
+        have_tool = False
+        if hasattr(self, 'model_kwargs') and 'tools' in self.model_kwargs:
+            should_stream = False
+            have_tool = True
+        kwargs.pop('stream', None)
+        kwargs.pop('streaming', None)
+        if should_stream:
+            stream_iter = self._astream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            return await agenerate_from_stream(stream_iter)
+        else:
+            ret = await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            return self.tool_string_return(ret, have_tool)
+
+
+class GenerateNormal:
+    def generate_prompt(
+            self,
+            prompts: List[PromptValue],
+            stop: Optional[List[str]] = None,
+            callbacks: Callbacks = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        prompt_messages = self.get_messages(prompts)
+        # prompt_messages = [p.to_messages() for p in prompts]
+        return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+
+    async def agenerate_prompt(
+            self,
+            prompts: List[PromptValue],
+            stop: Optional[List[str]] = None,
+            callbacks: Callbacks = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        prompt_messages = self.get_messages(prompts)
+        # prompt_messages = [p.to_messages() for p in prompts]
+        return await self.agenerate(
+            prompt_messages, stop=stop, callbacks=callbacks, **kwargs
+        )
+
+
+class GenerateStream2:
+    # slightly different from GenerateStream
+    def generate_prompt(
+            self,
+            prompts: List[PromptValue],
+            stop: Optional[List[str]] = None,
+            callbacks: Callbacks = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        self.prompts.extend(prompts)
+        prompt_messages = self.get_messages(prompts)
+        # prompt_messages = [p.to_messages() for p in prompts]
+        if self.stream_output:
+            kwargs.update(dict(stream=True))
+        if self.response_format:
+            kwargs.update(dict(response_format=self.response_format))
+        try:
+            return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+        except Exception as e:
+            t, v, tb = sys.exc_info()
+            ex = ''.join(traceback.format_exception(t, v, tb))
+            if 'assert generation is not None' in str(ex) or 'Input should be' in str(ex):
+                # try one more time
+                return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+            else:
+                raise
+
+    async def agenerate_prompt(
+            self,
+            prompts: List[PromptValue],
+            stop: Optional[List[str]] = None,
+            callbacks: Callbacks = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        self.prompts.extend(prompts)
+        prompt_messages = self.get_messages(prompts)
+        # prompt_messages = [p.to_messages() for p in prompts]
+        if self.stream_output:
+            kwargs.update(dict(stream=True))
+        if self.response_format:
+            kwargs.update(dict(response_format=self.response_format))
+        try:
+            return await self.agenerate(
+                prompt_messages, stop=stop, callbacks=callbacks, **kwargs
+            )
+        except Exception as e:
+            t, v, tb = sys.exc_info()
+            ex = ''.join(traceback.format_exception(t, v, tb))
+            if 'assert generation is not None' in str(ex) or 'Input should be' in str(ex):
+                # try one more time
+                return await self.agenerate(
+                    prompt_messages, stop=stop, callbacks=callbacks, **kwargs
+                )
+            else:
+                raise
+
+
+class H2OChatOpenAI(GenerateStream, ExtraChat, ChatOpenAI):
     tokenizer: Any = None  # for vllm_chat
     system_prompt: Any = None
     chat_conversation: Any = []
-    max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+    prompts: Any = []
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
+
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
 
     def get_token_ids(self, text: str) -> List[int]:
         if self.tokenizer is not None:
@@ -1165,59 +1878,110 @@ class H2OChatOpenAI(ChatOpenAI, ExtraChat):
             # OpenAI uses tiktoken
             return super().get_token_ids(text)
 
-    def generate_prompt(
-            self,
-            prompts: List[PromptValue],
-            stop: Optional[List[str]] = None,
-            callbacks: Callbacks = None,
-            **kwargs: Any,
-    ) -> LLMResult:
-        prompt_messages = self.get_messages(prompts)
-        # prompt_messages = [p.to_messages() for p in prompts]
-        return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
 
-    async def agenerate_prompt(
-            self,
-            prompts: List[PromptValue],
-            stop: Optional[List[str]] = None,
-            callbacks: Callbacks = None,
-            **kwargs: Any,
-    ) -> LLMResult:
-        prompt_messages = self.get_messages(prompts)
-        # prompt_messages = [p.to_messages() for p in prompts]
-        return await self.agenerate(
-            prompt_messages, stop=stop, callbacks=callbacks, **kwargs
-        )
-
-
-class H2OAzureChatOpenAI(AzureChatOpenAI, ExtraChat):
+class H2OAzureChatOpenAI(GenerateNormal, ExtraChat, AzureChatOpenAI):
     system_prompt: Any = None
     chat_conversation: Any = []
-    max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+    prompts: Any = []
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
 
-    def generate_prompt(
-            self,
-            prompts: List[PromptValue],
-            stop: Optional[List[str]] = None,
-            callbacks: Callbacks = None,
-            **kwargs: Any,
-    ) -> LLMResult:
-        prompt_messages = self.get_messages(prompts)
-        # prompt_messages = [p.to_messages() for p in prompts]
-        return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
 
-    async def agenerate_prompt(
-            self,
-            prompts: List[PromptValue],
-            stop: Optional[List[str]] = None,
-            callbacks: Callbacks = None,
-            **kwargs: Any,
-    ) -> LLMResult:
-        prompt_messages = self.get_messages(prompts)
-        # prompt_messages = [p.to_messages() for p in prompts]
-        return await self.agenerate(
-            prompt_messages, stop=stop, callbacks=callbacks, **kwargs
-        )
+
+class H2OChatAnthropic2(GenerateNormal, ExtraChat, ChatAnthropic2):
+    system_prompt: Any = None
+    chat_conversation: Any = []
+    prompts: Any = []
+    streaming: Any = True
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
+    tokenizer: Any = None
+
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+
+
+class H2OChatAnthropic2Sys(H2OChatAnthropic2):
+    pass
+
+
+class H2OChatAnthropic3(GenerateStream, ExtraChat, ChatAnthropic3):
+    system_prompt: Any = None
+    chat_conversation: Any = []
+    prompts: Any = []
+    streaming: Any = True
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
+    tokenizer: Any = None
+
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+
+
+class H2OChatAnthropic3Sys(H2OChatAnthropic3):
+    pass
+
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.language_models.chat_models import (
+    BaseChatModel,
+    agenerate_from_stream,
+    generate_from_stream
+)
+
+
+class H2OChatGoogle(GenerateStream, ExtraChat, ChatGoogleGenerativeAI):
+    system_prompt: Any = None
+    chat_conversation: Any = []
+    prompts: Any = []
+    streaming: Any = False
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
+
+    def get_token_ids(self, text: str) -> List[int]:
+        if self.tokenizer is not None:
+            return self.tokenizer.encode(text)
+        else:
+            return FakeTokenizer().encode(text)['input_ids']
+
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+
+
+class H2OChatMistralAI(GenerateStream2, ExtraChat, ChatMistralAI):
+    system_prompt: Any = None
+    chat_conversation: Any = []
+    prompts: Any = []
+    stream_output: bool = True
+    tokenizer: Any = None
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
+    response_format: Any = None
+
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+
+    def get_token_ids(self, text: str) -> List[int]:
+        if self.tokenizer is not None:
+            return self.tokenizer.encode(text)
+        else:
+            return FakeTokenizer().encode(text)['input_ids']
+
+
+class H2OChatGroq(GenerateStream2, ExtraChat, ChatGroq):
+    system_prompt: Any = None
+    chat_conversation: Any = []
+    prompts: Any = []
+    tokenizer: Any = None
+    stream_output: bool = True
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
+    response_format: Any = None
+
+    # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+
+    def get_token_ids(self, text: str) -> List[int]:
+        if self.tokenizer is not None:
+            return self.tokenizer.encode(text)
+        else:
+            return FakeTokenizer().encode(text)['input_ids']
 
 
 class H2OAzureOpenAI(AzureOpenAI):
@@ -1225,8 +1989,27 @@ class H2OAzureOpenAI(AzureOpenAI):
 
 
 class H2OHuggingFacePipeline(HuggingFacePipeline):
+    prompts: Any = []
     count_input_tokens: Any = 0
     count_output_tokens: Any = 0
+
+    def _generate(
+            self,
+            prompts: List[str],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        self.count_input_tokens += sum([self.get_num_tokens(x) for x in prompts])
+        rets = super()._generate(prompts, stop=stop, run_manager=run_manager, **kwargs)
+        try:
+            self.count_output_tokens += sum(
+                [self.get_num_tokens(z) for z in flatten_list([[x.text for x in y] for y in rets.generations])])
+        except Exception as e:
+            if os.getenv('HARD_ASSERTS'):
+                raise
+            print("Failed to get total output tokens\n%s\n" % traceback.format_exc())
+        return rets
 
     def _call(
             self,
@@ -1235,7 +2018,8 @@ class H2OHuggingFacePipeline(HuggingFacePipeline):
             run_manager: Optional[CallbackManagerForLLMRun] = None,
             **kwargs: Any,
     ) -> str:
-        self.count_input_tokens += self.get_num_tokens(prompt)
+        self.count_input_tokens += self.get_num_tokens(str(prompt))
+        self.prompts.append(prompt)
         response = self.pipeline(prompt, stop=stop)
         if self.pipeline.task == "text-generation":
             # Text generation return includes the starter text.
@@ -1269,14 +2053,18 @@ def get_llm(use_openai_model=False,
             model=None,
             tokenizer=None,
             inference_server=None,
+            regenerate_clients=None,
+            regenerate_gradio_clients=None,
             langchain_only_model=None,
+            load_awq='',
             stream_output=False,
             async_output=True,
             num_async=3,
             do_sample=False,
-            temperature=0.1,
-            top_p=0.7,
-            top_k=40,
+            seed=0,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
             penalty_alpha=0.0,
             num_beams=1,
             max_new_tokens=512,
@@ -1292,20 +2080,40 @@ def get_llm(use_openai_model=False,
             context=None,
             iinput=None,
             chat_conversation=None,
+            add_chat_history_to_context=True,
             sanitize_bot_response=False,
             system_prompt='',
+            allow_chat_system_prompt=True,
             visible_models=0,
             h2ogpt_key=None,
             min_max_new_tokens=None,
             max_input_tokens=None,
+            max_total_input_tokens=None,
             attention_sinks=None,
+            sink_dict={},
             truncation_generation=None,
+
+            langchain_agents=None,
 
             n_jobs=None,
             cli=False,
+            llamacpp_path=None,
             llamacpp_dict=None,
             exllama_dict=None,
             verbose=False,
+
+            image_file=None,
+            image_control=None,
+            document_choice=None,
+
+            response_format=None,
+            guided_json=None,
+            guided_regex=None,
+            guided_choice=None,
+            guided_grammar=None,
+
+            doing_grounding=False,
+            json_vllm=False,
             ):
     # make all return only new text, so other uses work as expected, like summarization
     only_new_text = True
@@ -1313,22 +2121,33 @@ def get_llm(use_openai_model=False,
 
     if chat_conversation is None:
         chat_conversation = []
+    # shallow copy, so if add image entry doesn't affect outer one, only returned one
+    chat_conversation = chat_conversation.copy()
+
+    # in case prompter updated
+    if prompter and prompter.system_prompt:
+        system_prompt = prompter.system_prompt
 
     fake_for_tests = ['test_qa', 'test_make_add_db', 'test_many_text', 'test_chroma_filtering']
     if os.getenv('HARD_ASSERTS') and tokenizer is None and any([x in get_test_name_core() for x in fake_for_tests]):
         # allow certain tests to use fake one
         tokenizer = FakeTokenizer()
         max_input_tokens = 1024
-        min_max_new_tokens = 256
+        min_max_new_tokens = 512
 
     model_max_length = tokenizer.model_max_length
-    if max_input_tokens >= 0:
-        max_input_tokens = min(model_max_length - min_max_new_tokens, max_input_tokens)
+    if not attention_sinks:
+        if max_input_tokens >= 0:
+            max_input_tokens = min(model_max_length - min_max_new_tokens, max_input_tokens)
+        else:
+            max_input_tokens = model_max_length - min_max_new_tokens
     else:
-        max_input_tokens = model_max_length - min_max_new_tokens
+        if max_input_tokens < 0:
+            max_input_tokens = model_max_length
 
     if n_jobs in [None, -1]:
         n_jobs = int(os.getenv('OMP_NUM_THREADS', str(os.cpu_count() // 2)))
+    n_gpus = n_gpus_global
     if inference_server is None:
         inference_server = ''
     if inference_server.startswith('replicate'):
@@ -1338,11 +2157,11 @@ def get_llm(use_openai_model=False,
         else:
             temperature = temperature if do_sample else 0
         gen_kwargs = dict(temperature=temperature,
-                          seed=1234,
+                          seed=seed,
                           max_length=max_new_tokens,  # langchain
                           max_new_tokens=max_new_tokens,  # replicate docs
-                          top_p=top_p if do_sample else 1,
-                          top_k=top_k,  # not always supported
+                          top_p=top_p if do_sample else 1.0,
+                          top_k=top_k if do_sample else 1,  # not always supported
                           repetition_penalty=repetition_penalty)
         if system_prompt in auto_choices:
             if prompter.system_prompt:
@@ -1388,41 +2207,100 @@ def get_llm(use_openai_model=False,
         # supports async_output=True if chosen
         if use_openai_model and model_name is None:
             model_name = "gpt-3.5-turbo"
-        # FIXME: Will later import be ignored?  I think so, so should be fine
-        openai, inf_type, deployment_name, base_url, api_version, api_key = set_openai(inference_server)
+            inference_server = 'openai_chat'
+        if not regenerate_clients and isinstance(model, dict):
+            openai_client, openai_async_client, \
+                inf_type, deployment_type, base_url, api_version, api_key = \
+                model['client'], model['async_client'], model['inf_type'], \
+                    model['deployment_type'], model['base_url'], model['api_version'], model['api_key']
+        else:
+            openai_client, openai_async_client, \
+                inf_type, deployment_type, base_url, api_version, api_key = \
+                set_openai(inference_server, model_name=model_name)
+
+        if inf_type in ['vllm_chat', 'openai_chat', 'openai_azure_chat']:
+            openai_client_completions = openai_client.chat.completions
+            openai_async_client_completions = openai_async_client.chat.completions
+        else:
+            openai_client_completions = openai_client.completions
+            openai_async_client_completions = openai_async_client.completions
 
         # Langchain oddly passes some things directly and rest via model_kwargs
-        model_kwargs = dict(top_p=top_p if do_sample else 1,
+        model_kwargs = dict(top_p=top_p if do_sample else 1.0,
                             frequency_penalty=0,
-                            presence_penalty=1.07 - repetition_penalty + 0.6,
-                            logit_bias=None if inf_type == 'vllm' else {},
+                            presence_penalty=(repetition_penalty - 1.0) * 2.0 + 0.0,  # so good default
                             )
+        if not is_vision_model(model_name):
+            model_kwargs.update(dict(logit_bias=None if inf_type == 'vllm' else {}))
+        # if inference_server.startswith('vllm'):
+        #    model_kwargs.update(dict(repetition_penalty=repetition_penalty))
+
+        azure_kwargs = dict(openai_api_type='azure',
+                            openai_api_key=api_key,
+                            api_version=api_version,
+                            deployment_name=deployment_type,
+                            azure_endpoint=base_url,
+                            )
+        if langchain_agents is not None and \
+                LangChainAgent.AUTOGPT.value in langchain_agents and \
+                does_support_json_mode(inference_server, model_name):
+            azure_kwargs.update(response_format={"type": "json_object"})
 
         kwargs_extra = {}
+
+        vllm_extra_dict = get_vllm_extra_dict(tokenizer,
+                                              stop_sequences=prompter.stop_sequences if prompter else [],
+                                              # repetition_penalty=repetition_penalty,  # could pass
+                                              response_format=response_format if guided_json else 'text',
+                                              guided_json=guided_json,
+                                              guided_regex=guided_regex,
+                                              guided_choice=guided_choice,
+                                              guided_grammar=guided_grammar,
+                                              )
+
         if inf_type == 'openai_chat' or inf_type == 'vllm_chat':
             kwargs_extra.update(dict(system_prompt=system_prompt, chat_conversation=chat_conversation))
             cls = H2OChatOpenAI
             # FIXME: Support context, iinput
             if inf_type == 'vllm_chat':
-                async_sem = asyncio.Semaphore(num_async) if async_output else NullContext()
+                if is_json_model(model_name, inference_server,
+                                 json_vllm=json_vllm) and response_format == 'json_object':
+                    # vllm without guided_json can't make json directly
+                    kwargs_extra.update(dict(type=response_format if guided_json else 'text'))
+                async_output = False  # https://github.com/h2oai/h2ogpt/issues/928
+                # async_sem = asyncio.Semaphore(num_async) if async_output else NullContext()
                 kwargs_extra.update(dict(tokenizer=tokenizer,
-                                         batch_size=1,  # https://github.com/h2oai/h2ogpt/issues/928
-                                         async_sem=async_sem,
+                                         openai_api_key=api_key,
+                                         # batch_size=1,
+                                         client=openai_client_completions,
+                                         async_client=openai_async_client_completions,
+                                         # async_sem=async_sem,
                                          ))
-            openai_api_key = openai.api_key
+                model_kwargs.update(vllm_extra_dict)
+            else:
+                if is_json_model(model_name, inference_server) and response_format == 'json_object':
+                    kwargs_extra.update(dict(response_format=dict(type=response_format)))
         elif inf_type == 'openai_azure_chat':
             cls = H2OAzureChatOpenAI
+            if 'response_format' not in azure_kwargs and \
+                    response_format == 'json_object' and \
+                    is_json_model(model_name, inference_server):
+                # overrides doc_json_mode if set
+                azure_kwargs.update(dict(response_format=dict(type=response_format)))
             kwargs_extra.update(
-                dict(openai_api_type='azure', system_prompt=system_prompt, chat_conversation=chat_conversation))
+                dict(system_prompt=system_prompt,
+                     chat_conversation=chat_conversation,
+                     **azure_kwargs,
+                     ))
             # FIXME: Support context, iinput
-            openai_api_key = openai.api_key
         elif inf_type == 'openai_azure':
             cls = H2OAzureOpenAI
-            kwargs_extra.update(dict(openai_api_type='azure'))
+            kwargs_extra.update(
+                dict(**azure_kwargs,
+                     ))
             kwargs_extra.update(model_kwargs)
             model_kwargs = {}
             # FIXME: Support context, iinput
-            openai_api_key = openai.api_key
         else:
             cls = H2OOpenAI
             if inf_type == 'vllm':
@@ -1433,43 +2311,37 @@ def get_llm(use_openai_model=False,
                                          context=context,
                                          iinput=iinput,
                                          tokenizer=tokenizer,
-                                         openai_api_base=openai.api_base,
+                                         openai_api_base=base_url,
+                                         openai_api_key=api_key,
                                          batch_size=1,  # https://github.com/h2oai/h2ogpt/issues/928
-                                         client=None,
+                                         client=openai_client_completions,
+                                         async_client=openai_async_client_completions,
                                          async_sem=async_sem,
+                                         max_new_tokens0=max_new_tokens0,
                                          ))
                 kwargs_extra.update(model_kwargs)
                 model_kwargs = {}
+                model_kwargs.update(vllm_extra_dict)
             else:
                 assert inf_type == 'openai' or use_openai_model, inf_type
-            openai_api_key = openai.api_key
 
-        if deployment_name:
-            kwargs_extra.update(dict(deployment_name=deployment_name))
-        if api_version:
-            kwargs_extra.update(dict(openai_api_version=api_version))
-        elif openai.api_version:
-            kwargs_extra.update(dict(openai_api_version=openai.api_version))
-        elif inf_type in ['openai_azure', 'openai_azure_chat']:
-            # https://github.com/Azure/azure-rest-api-specs/tree/main/specification/cognitiveservices/data-plane/AzureOpenAI/inference/preview/2023-10-01-preview
-            kwargs_extra.update(dict(openai_api_version="2023-10-01-preview"))
-        if base_url:
-            kwargs_extra.update(dict(openai_api_base=base_url))
-        else:
-            kwargs_extra.update(dict(openai_api_base=openai.api_base))
+        if is_vision_model(model_name):
+            img_file = get_image_file(image_file, image_control, document_choice, convert=True, str_bytes=False)
+            if img_file:
+                chat_conversation.append((img_file, gpt4imagetag))
 
         callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]
+        model_kwargs.update(dict(seed=seed))
         llm = cls(model_name=model_name,
-                  temperature=temperature if do_sample else 0,
+                  temperature=temperature if do_sample else 0.0,
                   # FIXME: Need to count tokens and reduce max_new_tokens to fit like in generate.py
                   max_tokens=max_new_tokens,
-                  max_new_tokens0=max_new_tokens0,
                   model_kwargs=model_kwargs,
                   callbacks=callbacks if stream_output else None,
-                  openai_api_key=openai_api_key,
                   max_retries=6,
                   streaming=stream_output,
                   verbose=verbose,
+                  request_timeout=max_time,
                   **kwargs_extra
                   )
         streamer = callbacks[0] if stream_output else None
@@ -1477,7 +2349,180 @@ def get_llm(use_openai_model=False,
             prompt_type = inference_server
         else:
             # vllm goes here
-            prompt_type = prompt_type or 'plain'
+            prompt_type = prompt_type or unknown_prompt_type
+    elif inference_server.startswith('anthropic'):
+        # no explicit JSON mode for anthropic
+        # FIXME: Should use function calling
+        # https://docs.anthropic.com/claude/docs/control-output-format
+
+        if model_name in ["claude-2.0", "claude-2"]:
+            cls = H2OChatAnthropic2
+        elif model_name == "claude-2.1":
+            # https://docs.anthropic.com/claude/docs/how-to-use-system-prompts
+            cls = H2OChatAnthropic2Sys
+        else:
+            cls = H2OChatAnthropic3Sys
+
+            if is_vision_model(model_name):
+                img_file = get_image_file(image_file, image_control, document_choice, convert=True, str_bytes=False)
+                if img_file:
+                    chat_conversation.append((img_file, claude3imagetag))
+
+        # Langchain oddly passes some things directly and rest via model_kwargs
+        # NOTE: claude requires keys of properties to match pattern '^[a-zA-Z0-9_-]{1,64}$'
+        # i.e. no spaces, while vLLM can handle spaces.
+        if is_json_model(model_name, inference_server) and guided_json and response_format == 'json_object':
+            # https://docs.anthropic.com/claude/docs/tool-use#specifying-tools
+            model_kwargs = dict(tools=[
+                {
+                    "name": "JSON",
+                    "description": "Document, image, chat history conversion to strict JSON.",
+                    "input_schema": guided_json,
+                }
+            ])
+        else:
+            model_kwargs = {}
+        kwargs_extra = {}
+        kwargs_extra.update(dict(system_prompt=system_prompt, chat_conversation=chat_conversation))
+        if not regenerate_clients and isinstance(model, dict):
+            # FIXME: _AnthropicCommon ignores these and makes no client anyways
+            kwargs_extra.update(dict(client=model['client'], async_client=model['async_client']))
+
+        callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]
+        llm = cls(model=model_name,
+                  anthropic_api_key=os.getenv('ANTHROPIC_API_KEY'),
+                  max_tokens=max_new_tokens,
+                  top_p=top_p if do_sample else 1.0,
+                  top_k=top_k if do_sample else 1,
+                  temperature=temperature if do_sample else 0,
+                  # seed=seed,  # FIXME: Not supported yet
+                  callbacks=callbacks if stream_output else None,
+                  streaming=stream_output,
+                  default_request_timeout=max_time,
+                  model_kwargs=model_kwargs,
+                  tokenizer=tokenizer,
+                  verbose=verbose,
+                  **kwargs_extra
+                  )
+        streamer = callbacks[0] if stream_output else None
+        prompt_type = inference_server
+    elif inference_server.startswith('google'):
+        # google doesn't have JSON mode but can use function calling so can give schema
+        # https://ai.google.dev/tutorials/structured_data_extraction
+
+        cls = H2OChatGoogle
+
+        # Langchain oddly passes some things directly and rest via model_kwargs
+        model_kwargs = dict()
+        kwargs_extra = {}
+        kwargs_extra.update(dict(system_prompt=system_prompt, chat_conversation=chat_conversation))
+        if not regenerate_clients and isinstance(model, dict):
+            kwargs_extra.update(dict(client=model['client'], async_client=model['async_client']))
+
+        if is_vision_model(model_name):
+            img_file = get_image_file(image_file, image_control, document_choice, convert=True, str_bytes=False)
+            if img_file:
+                chat_conversation.append((img_file, geminiimagetag))
+                # https://github.com/langchain-ai/langchain/issues/19115
+                stream_output = False  # BUG IN GOOGLE/LANGCHAIN
+            else:
+                if '-vision' in model_name:
+                    model_name = model_name.replace('-vision', '')
+
+        callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]
+        llm = cls(model=model_name,
+                  google_api_key=os.getenv('GOOGLE_API_KEY'),
+                  top_p=top_p if do_sample else 1.0,
+                  top_k=top_k if do_sample else 1,
+                  temperature=temperature if do_sample else 0,
+                  callbacks=callbacks if stream_output else None,
+                  streaming=stream_output,
+                  default_request_timeout=max_time,
+                  max_output_tokens=max_new_tokens,
+                  n=1,  # candidates
+                  # seed=seed,  # FIXME: Not supported yet
+                  model_kwargs=model_kwargs,
+                  verbose=verbose,
+                  tokenizer=tokenizer,
+                  **kwargs_extra
+                  )
+        streamer = callbacks[0] if stream_output else None
+        prompt_type = inference_server
+    elif inference_server.startswith('mistralai'):
+        cls = H2OChatMistralAI
+
+        # Langchain oddly passes some things directly and rest via model_kwargs
+        model_kwargs = dict()
+        kwargs_extra = {}
+        kwargs_extra.update(dict(system_prompt=system_prompt, chat_conversation=chat_conversation))
+        if not regenerate_clients and isinstance(model, dict):
+            kwargs_extra.update(dict(client=model['client'], async_client=model['async_client']))
+
+        callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]
+        # https://mistral.ai/news/mistral-large/
+
+        if is_json_model(model_name, inference_server) and response_format == 'json_object':
+            # https://docs.mistral.ai/platform/client/#json-mode
+            # odd outputs for mistral-medium and mistral-tiny as of 04/02/2024
+            # As if still since Feb 26, 2024 no updates for other models despite the bottom of https://mistral.ai/news/mistral-large/
+            kwargs_extra.update(dict(response_format=dict(type=response_format)))
+
+        llm = cls(model=model_name,
+                  mistral_api_key=os.getenv('MISTRAL_API_KEY'),
+                  top_p=top_p if do_sample else 1.0,
+                  top_k=top_k if do_sample else 1,
+                  temperature=temperature if do_sample else 0,
+                  callbacks=callbacks if stream_output else None,
+                  streaming=stream_output,
+                  stream=stream_output,
+                  stream_output=stream_output,
+                  default_request_timeout=max_time,
+                  model_kwargs=model_kwargs,
+                  max_tokens=max_new_tokens,
+                  safe_mode=False,
+                  random_seed=seed,
+                  verbose=verbose,
+                  tokenizer=tokenizer,
+                  **kwargs_extra,
+                  llm_kwargs=dict(stream=True),
+                  )
+        streamer = callbacks[0] if stream_output else None
+        prompt_type = inference_server
+    elif inference_server.startswith('groq'):
+        if len(inference_server.split(':')) == 2:
+            groq_api_key = inference_server.split(':')[1]
+            inference_server = inference_server.split(':')[0]
+        else:
+            groq_api_key = os.getenv('GROQ_API_KEY')
+        cls = H2OChatGroq
+
+        # Langchain oddly passes some things directly and rest via model_kwargs
+        model_kwargs = dict()
+        kwargs_extra = {}
+        kwargs_extra.update(dict(system_prompt=system_prompt, chat_conversation=chat_conversation))
+        if not regenerate_clients and isinstance(model, dict):
+            kwargs_extra.update(dict(client=model['client'], async_client=model['async_client']))
+
+        callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]
+        llm = cls(model=model_name,
+                  groq_api_key=groq_api_key,
+                  temperature=temperature if do_sample else 0,
+                  callbacks=callbacks if stream_output else None,
+                  max_retries=2,
+                  streaming=stream_output,
+                  # stream=stream_output,
+                  n=1,
+                  max_tokens=max_new_tokens,
+                  model_kwargs=dict(
+                      top_p=top_p if do_sample else 1.0,
+                      # seed=seed,  # FIXME: not supported yet
+                      # top_k=top_k,
+                  ),
+                  tokenizer=tokenizer,
+                  **kwargs_extra,
+                  )
+        streamer = callbacks[0] if stream_output else None
+        prompt_type = inference_server
     elif inference_server and inference_server.startswith('sagemaker'):
         callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]  # FIXME
         streamer = None
@@ -1490,8 +2535,10 @@ def get_llm(use_openai_model=False,
             content_handler = ChatContentHandler()
         else:
             content_handler = BaseContentHandler()
-        model_kwargs = dict(temperature=temperature if do_sample else 1E-10,
-                            return_full_text=False, top_p=top_p, max_new_tokens=max_new_tokens)
+        model_kwargs = dict(temperature=temperature if do_sample else 1E-2,
+                            return_full_text=False,
+                            top_p=top_p if do_sample else 1.0,
+                            max_new_tokens=max_new_tokens)
         llm = H2OSagemakerEndpoint(
             endpoint_name=endpoint_name,
             region_name=region_name,
@@ -1507,26 +2554,94 @@ def get_llm(use_openai_model=False,
         assert inference_server.startswith(
             'http'), "Malformed inference_server=%s.  Did you add http:// in front?" % inference_server
 
+        if is_gradio_vision_model(model_name):
+            img_file = get_image_file(image_file, image_control, document_choice)
+        else:
+            img_file = None
+
+        from gradio_client import Client
         from gradio_utils.grclient import GradioClient
         from text_generation import Client as HFClient
-        if isinstance(model, GradioClient):
+        if isinstance(model, Client):
+            gradio_server = True
+            gr_client = model
+            hf_client = None
+        elif isinstance(model, GradioClient):
             gradio_server = True
             gr_client = model.clone()
             hf_client = None
-        else:
+        elif not regenerate_gradio_clients:
             gr_client = None
             hf_client = model
             assert isinstance(hf_client, HFClient)
+            img_file = None
+        else:
+            gr_client = None
+            hf_client = None
+            img_file = None
 
-        inference_server, headers = get_hf_server(inference_server)
+        if regenerate_gradio_clients and gr_client:
+            # regenerate or leave None for llava so created inside
+            inference_server, gr_client, hf_client = get_client_from_inference_server(inference_server,
+                                                                                      base_model=model_name,
+                                                                                      verbose=verbose)
+        inference_server, _, _, _ = get_hf_server(inference_server)
 
         # quick sanity check to avoid long timeouts, just see if can reach server
         requests.get(inference_server, timeout=int(os.getenv('REQUEST_TIMEOUT_FAST', '10')))
         callbacks = [StreamingGradioCallbackHandler(max_time=max_time, verbose=verbose)]
 
         async_sem = asyncio.Semaphore(num_async) if async_output else NullContext()
-        if gr_client:
+
+        llava_direct_gradio = gr_client is not None and '/textbox_api_submit' in [x.api_name for x in
+                                                                                  gr_client.endpoints]
+
+        if is_gradio_vision_model(model_name) and llava_direct_gradio:
+            llm = GradioLLaVaInference(
+                inference_server_url=inference_server,
+
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                penalty_alpha=penalty_alpha,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                early_stopping=early_stopping,
+                max_time=max_time,
+                repetition_penalty=repetition_penalty,
+                num_return_sequences=num_return_sequences,
+                do_sample=do_sample,
+                seed=seed,
+
+                callbacks=callbacks if stream_output else None,
+                stream_output=stream_output,
+
+                prompter=prompter,
+                context=context,
+                iinput=iinput,
+                client=gr_client,
+                tokenizer=tokenizer,
+                system_prompt=system_prompt,
+                chat_conversation=chat_conversation,
+                add_chat_history_to_context=add_chat_history_to_context,
+                # visible_models=visible_models,
+                visible_models=model_name,
+                h2ogpt_key=h2ogpt_key,
+                min_max_new_tokens=min_max_new_tokens,
+                max_input_tokens=max_input_tokens,
+                max_total_input_tokens=max_total_input_tokens,
+                async_sem=async_sem,
+                verbose=verbose,
+
+                image_file=img_file,  # we pass file name itself
+            )
+        elif gr_client:
+            # ensure image in correct format
+            img_file = get_image_file(image_file, image_control, document_choice, convert=True)
+
             chat_client = False
+            from src.vision.utils_vision import img_to_base64
             llm = GradioInference(
                 inference_server_url=inference_server,
                 return_full_text=False,
@@ -1543,10 +2658,12 @@ def get_llm(use_openai_model=False,
                 repetition_penalty=repetition_penalty,
                 num_return_sequences=num_return_sequences,
                 do_sample=do_sample,
+                seed=seed,
                 chat_client=chat_client,
 
                 callbacks=callbacks if stream_output else None,
                 stream_output=stream_output,
+
                 prompter=prompter,
                 context=context,
                 iinput=iinput,
@@ -1554,27 +2671,42 @@ def get_llm(use_openai_model=False,
                 sanitize_bot_response=sanitize_bot_response,
                 tokenizer=tokenizer,
                 system_prompt=system_prompt,
+                chat_conversation=chat_conversation,
+                add_chat_history_to_context=add_chat_history_to_context,
                 visible_models=visible_models,
                 h2ogpt_key=h2ogpt_key,
                 min_max_new_tokens=min_max_new_tokens,
                 max_input_tokens=max_input_tokens,
+                max_total_input_tokens=max_total_input_tokens,
                 async_sem=async_sem,
                 verbose=verbose,
+
+                image_file=img_file,
+                image_control=None,  # already stuffed into image_file
+
+                response_format=response_format,
+                guided_json=guided_json,
+                guided_regex=guided_regex,
+                guided_choice=guided_choice,
+                guided_grammar=guided_grammar,
+
+                doing_grounding=doing_grounding,
             )
         elif hf_client:
             # no need to pass original client, no state and fast, so can use same validate_environment from base class
+            # H2Oagenerate coming first in class makes these appear like unused inputs, but not case
             llm = H2OHuggingFaceTextGenInference(
                 inference_server_url=inference_server,
                 do_sample=do_sample,
                 max_new_tokens=max_new_tokens,
                 repetition_penalty=repetition_penalty,
                 return_full_text=False,  # this only controls internal behavior, still returns processed text
-                seed=SEED,
+                seed=seed,
 
                 stop_sequences=prompter.stop_sequences,
-                temperature=temperature,
+                temperature=max(1e-2, temperature),
                 top_k=top_k,
-                top_p=top_p,
+                top_p=min(max(1e-3, top_p), 1.0 - 1e-3),
                 # typical_p=top_p,
                 callbacks=callbacks if stream_output else None,
                 stream_output=stream_output,
@@ -1604,13 +2736,15 @@ def get_llm(use_openai_model=False,
         if prompter:
             prompt_type = prompter.prompt_type
         else:
-            prompter = Prompter(prompt_type, prompt_dict, debug=False, chat=False, stream_output=stream_output)
+            prompter = Prompter(prompt_type, prompt_dict, debug=False, stream_output=stream_output,
+            tokenizer=tokenizer)
             pass  # assume inputted prompt_type is correct
         from gpt4all_llm import get_llm_gpt4all
-        llm = get_llm_gpt4all(model_name,
+        llm = get_llm_gpt4all(model_name=model_name,
                               model=model,
                               max_new_tokens=max_new_tokens,
                               temperature=temperature,
+                              seed=seed,
                               repetition_penalty=repetition_penalty,
                               top_k=top_k,
                               top_p=top_p,
@@ -1622,7 +2756,10 @@ def get_llm(use_openai_model=False,
                               context=context,
                               iinput=iinput,
                               max_seq_len=model_max_length,
+                              llamacpp_path=llamacpp_path,
                               llamacpp_dict=llamacpp_dict,
+                              n_gpus=n_gpus,
+                              max_time=max_time,
                               )
     elif hasattr(model, 'is_exlama') and model.is_exlama():
         async_output = False  # FIXME: not implemented yet
@@ -1643,6 +2780,7 @@ def get_llm(use_openai_model=False,
                       top_p=top_p,
                       typical=.7,
                       beams=1,
+                      beam_length=0,
                       # beam_length = 40,
                       stop_sequences=prompter.stop_sequences,
                       callbacks=callbacks,
@@ -1668,10 +2806,11 @@ def get_llm(use_openai_model=False,
                 # model_name = 'h2oai/h2ogpt-oig-oasst1-512-6_9b'
                 # model_name = 'h2oai/h2ogpt-oasst1-512-20b'
             inference_server = ''
-            model, tokenizer, device = get_model(load_8bit=True, base_model=model_name,
-                                                 inference_server=inference_server, gpu_id=0)
+            model, tokenizer, device = get_model_retry(load_8bit=True, base_model=model_name,
+                                                       inference_server=inference_server, gpu_id=0)
 
         gen_kwargs = dict(do_sample=do_sample,
+                          seed=seed,
                           num_beams=num_beams,
                           max_new_tokens=max_new_tokens,
                           min_new_tokens=min_new_tokens,
@@ -1691,6 +2830,13 @@ def get_llm(use_openai_model=False,
             gen_kwargs.update(dict(penalty_alpha=penalty_alpha))
             assert len(set(gen_hyper0).difference(gen_kwargs.keys())) == 0
 
+        if attention_sinks:
+            from transformers import SinkCache
+            sink_dict['window_length'] = sink_dict.get('window_length', max_input_tokens)
+            sink_dict['num_sink_tokens'] = sink_dict.get('num_sink_tokens', 4)
+            cache = SinkCache(**sink_dict)
+            gen_kwargs.update(dict(past_key_values=cache))
+
         if stream_output:
             skip_prompt = only_new_text
             from gen import H2OTextIteratorStreamer
@@ -1701,7 +2847,13 @@ def get_llm(use_openai_model=False,
             streamer = None
 
         from h2oai_pipeline import H2OTextGenerationPipeline
-        pipe = H2OTextGenerationPipeline(model=model, use_prompter=True,
+
+        if load_awq and hasattr(model, 'model'):
+            # need this else get device on multiple devices cuda and cpu
+            # e.g. AutoAWQForCausalLM
+            model = model.model
+        pipe = H2OTextGenerationPipeline(model=model,
+                                         use_prompter=True,
                                          prompter=prompter,
                                          context=context,
                                          iinput=iinput,
@@ -1718,6 +2870,7 @@ def get_llm(use_openai_model=False,
         # pipe.task = "text-generation"
         # below makes it listen only to our prompt removal,
         # not built in prompt removal that is less general and not specific for our model
+        # also works for Conditional generation: https://github.com/huggingface/transformers/issues/27870#issuecomment-1844775749
         pipe.task = "text2text-generation"
 
         llm = H2OHuggingFacePipeline(pipeline=pipe)
@@ -1727,7 +2880,7 @@ def get_llm(use_openai_model=False,
 def get_device_dtype():
     # torch.device("cuda") leads to cuda:x cuda:y mismatches for multi-GPU consistently
     import torch
-    n_gpus = torch.cuda.device_count() if torch.cuda.is_available else 0
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     device = 'cpu' if n_gpus == 0 else 'cuda'
     # from utils import NullContext
     # context_class = NullContext if n_gpus > 1 or n_gpus == 0 else context_class
@@ -1880,14 +3033,7 @@ def get_supported_types():
                     'FLV', 'SWF',
                     'AVCHD']
     video_types0 = [x.lower() for x in video_types0]
-    if have_pillow:
-        from PIL import Image
-        exts = Image.registered_extensions()
-        image_types0 = {ex for ex, f in exts.items() if f in Image.OPEN if ex not in video_types0 + non_image_types0}
-        image_types0 = sorted(image_types0)
-        image_types0 = [x[1:] if x.startswith('.') else x for x in image_types0]
-    else:
-        image_types0 = []
+    image_types0 = get_image_types()
     return non_image_types0, image_types0, video_types0
 
 
@@ -1900,7 +3046,13 @@ if have_libreoffice or True:
 if have_jq:
     non_image_types.extend(["json", "jsonl"])
 
-file_types = non_image_types + image_types
+if have_librosa:
+    audio_types = ['aac', 'au', 'mp3', 'ogg', 'flac', 'm4a', 'wav', 'mp4', 'mpeg', 'mpg']
+else:
+    audio_types = []
+set_audio_types = set(audio_types)
+
+file_types = non_image_types + image_types + audio_types
 
 
 def try_as_html(file):
@@ -1953,11 +3105,82 @@ def get_each_page(file):
         tar = fitz.open()  # output PDF for 1 page
         # copy over current page
         tar.insert_pdf(src, from_page=page.number, to_page=page.number)
-        page = f"{file}-page-{page.number}.pdf"
-        tar.save(page)
+        tmpdir = os.getenv('TMPDDIR', tempfile.mkdtemp())
+        makedirs(tmpdir, exist_ok=True)
+        page_file = os.path.join(tmpdir, f"{file}-page-{page.number}-{str(uuid.uuid4())}.pdf")
+        makedirs(os.path.dirname(page_file), exist_ok=True)
+        tar.save(page_file)
         tar.close()
-        pages.append(page)
+        pages.append(page_file)
     return pages
+
+
+class Crawler:
+    # FIXME: Consider scrapy
+    # https://www.scrapingbee.com/blog/crawling-python/
+    # https://github.com/scrapy/scrapy
+    # https://www.scrapingbee.com/blog/web-scraping-with-scrapy/
+
+    def __init__(self, urls=[], deeper_only=True, depth=int(os.getenv('CRAWL_DEPTH', '1')), verbose=False):
+        self.visited_urls = []
+        self.urls_to_visit = urls.copy()
+        self.starting_urls = urls.copy()
+        self.deeper_only = deeper_only
+        self.depth = depth
+        self.verbose = verbose
+        self.final_urls = []
+
+    def download_url(self, url):
+        return requests.get(url).text
+
+    def get_linked_urls(self, url, html):
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+
+        soup = BeautifulSoup(html, 'html.parser')
+        for link in soup.find_all('a'):
+            path = link.get('href')
+            if path and path.startswith('/'):
+                path = urljoin(url, path)
+            yield path
+
+    def add_url_to_visit(self, url):
+        if url not in self.visited_urls and url not in self.urls_to_visit:
+            if url in self.starting_urls:
+                pass
+            elif self.deeper_only and not any(url.startswith(x) for x in self.starting_urls):
+                if self.verbose:
+                    print("Skipped %s" % url, flush=True)
+            else:
+                self.urls_to_visit.append(url)
+                if self.verbose:
+                    print("Added %s" % url, flush=True)
+
+    def crawl(self, url):
+        html = self.download_url(url)
+        for url in self.get_linked_urls(url, html):
+            self.add_url_to_visit(url)
+
+    def run(self):
+        depth = 0
+        while self.urls_to_visit:
+            url = self.urls_to_visit.pop(0)
+            if self.verbose:
+                print(f'Crawling: {url}', flush=True)
+            try:
+                self.crawl(url)
+            except Exception as e:
+                if self.verbose:
+                    print(f'Failed to crawl: {url}: {str(e)}', flush=True)
+            finally:
+                self.visited_urls.append(url)
+                if depth >= self.depth:
+                    if self.verbose:
+                        print("Done crawling", flush=True)
+                    break
+                depth += 1
+        self.final_urls = sorted(set(self.urls_to_visit + self.visited_urls))
+        return self.final_urls
 
 
 def file_to_doc(file,
@@ -1970,6 +3193,8 @@ def file_to_doc(file,
                 use_unstructured=True,
                 use_playwright=False,
                 use_selenium=False,
+                use_scrapeplaywright=False,
+                use_scrapehttp=False,
 
                 # pdfs
                 use_pymupdf='auto',
@@ -1984,20 +3209,81 @@ def file_to_doc(file,
                 enable_doctr=False,
                 enable_pix2struct=False,
                 enable_captions=True,
+                enable_llava=True,
+                enable_transcriptions=True,
                 captions_model=None,
+                llava_model=None,
+                llava_prompt=None,
+
+                asr_model=None,
+                asr_gpu_id=0,
+
                 model_loaders=None,
 
                 # json
                 jq_schema='.[]',
+                extract_frames=10,
 
                 headsize=50,  # see also H2OSerpAPIWrapper
                 db_type=None,
-                selected_file_types=None):
+                selected_file_types=None,
+
+                is_public=False,
+                from_ui=True,
+                ):
+    # SOME AUTODETECTION LOGIC FOR URL VS TEXT
+
+    file_stripped = file.strip()  # in case accidental spaces in front or at end
+    if file_stripped == '':
+        raise ValueError("Refusing to accept empty data")
+    file_lower = file_stripped.lower()
+    case1_arxiv = file_lower.startswith('arxiv:') and len(file_lower.split('arxiv:')) == 2
+    case2_arxiv = file_lower.startswith('https://arxiv.org/abs') and len(file_lower.split('https://arxiv.org/abs')) == 2
+    case3_arxiv = file_lower.startswith('http://arxiv.org/abs') and len(file_lower.split('http://arxiv.org/abs')) == 2
+    case4_arxiv = file_lower.startswith('arxiv.org/abs/') and len(file_lower.split('arxiv.org/abs/')) == 2
+
+    url_prefixes_youtube = [
+        'https://www.youtube.com/watch?v=',
+        'http://www.youtube.com/watch?v=',
+        'www.youtube.com/watch?v=',
+        'youtube.com/watch?v=',
+        'https://youtube.com/watch?v=',
+        'http://youtube.com/watch?v=',
+
+        'https://www.youtube.com/shorts/',
+        'http://www.youtube.com/shorts/',
+        'https://youtube.com/shorts/',
+        'http://youtube.com/shorts/',
+        'www.youtube.com/shorts/',
+        'youtube.com/shorts/'
+    ]
+
+    is_arxiv = case1_arxiv or case2_arxiv or case3_arxiv or case4_arxiv
+    is_youtube = any(
+        file_lower.startswith(prefix) and len(file_lower.split(prefix)) == 2 for prefix in url_prefixes_youtube)
+
+    if is_url and is_txt:
+        # decide which
+        if ' ' in file_stripped:
+            # can't have literal space in URL
+            is_url = False
+        elif is_arxiv or is_youtube:
+            # force it
+            is_txt = False
+        else:
+            file_test = return_good_url(file_stripped)
+            if file_test is None:
+                is_url = False
+            else:
+                is_txt = False
+
     assert isinstance(model_loaders, dict)
     if selected_file_types is not None:
-        set_image_types1 = set_image_types.intersection(set(selected_file_types))
+        set_image_audio_types1 = set_image_types.intersection(set(selected_file_types))
+        set_audio_types1 = set_audio_types.intersection(set(selected_file_types))
     else:
-        set_image_types1 = set_image_types
+        set_image_audio_types1 = set_image_types
+        set_audio_types1 = set_audio_types
 
     assert db_type is not None
     chunk_sources = functools.partial(_chunk_sources, chunk=chunk, chunk_size=chunk_size, db_type=db_type)
@@ -2015,6 +3301,8 @@ def file_to_doc(file,
                                           use_unstructured=use_unstructured,
                                           use_playwright=use_playwright,
                                           use_selenium=use_selenium,
+                                          use_scrapeplaywright=use_scrapeplaywright,
+                                          use_scrapehttp=use_scrapehttp,
 
                                           # pdfs
                                           use_pymupdf=use_pymupdf,
@@ -2030,15 +3318,28 @@ def file_to_doc(file,
                                           enable_pix2struct=enable_pix2struct,
                                           enable_captions=enable_captions,
                                           captions_model=captions_model,
+                                          enable_llava=enable_llava,
+                                          llava_model=llava_model,
+                                          llava_prompt=llava_prompt,
+
+                                          # audio
+                                          enable_transcriptions=enable_transcriptions,
+                                          asr_model=asr_model,
 
                                           caption_loader=model_loaders['caption'],
                                           doctr_loader=model_loaders['doctr'],
                                           pix2struct_loader=model_loaders['pix2struct'],
+                                          asr_loader=model_loaders['asr'],
 
                                           # json
                                           jq_schema=jq_schema,
+                                          # video
+                                          extract_frames=extract_frames,
 
                                           db_type=db_type,
+
+                                          is_public=is_public,
+                                          from_ui=from_ui,
                                           )
 
     if file is None:
@@ -2055,21 +3356,37 @@ def file_to_doc(file,
         # if from gradio, will have its own temp uuid too, but that's ok
         base_name = sanitize_filename(base_name) + "_" + str(uuid.uuid4())[:10]
         base_path = os.path.join(dir_name, base_name)
+
+    orig_url = None
+    if is_url and any([file.strip().lower().endswith('.' + x) for x in file_types]):
+        # then just download, so can use good parser, not always unstructured url parser
+        base_path_url = os.path.join(get_gradio_tmp(), "urls_downloaded")
+        base_path_url = makedirs(base_path_url, exist_ok=True, tmp_ok=True, use_base=True)
+        source_file = os.path.join(base_path_url,
+                                   "_%s_%s" % ("_" + str(uuid.uuid4())[:10], os.path.basename(urlparse(file).path)))
+        try:
+            download_simple(file, source_file, overwrite=True, verbose=verbose)
+        except BaseException as e:
+            print("Download simple failed: %s, trying other means" % str(e), flush=True)
+        if os.path.isfile(source_file):
+            orig_url = file
+            is_url = False
+            file = source_file
+
+    can_do_audio_transcription = isinstance(file, str) and \
+                                 any(file.lower().endswith(x) for x in set_audio_types1) and enable_transcriptions
+    can_do_video_extraction = isinstance(file, str) and \
+                              any([file.endswith(x) for x in video_types]) and extract_frames > 0 and have_fiftyone
+
     if is_url:
-        file = file.strip()  # in case accidental spaces in front or at end
-        file_lower = file.lower()
-        case1 = file_lower.startswith('arxiv:') and len(file_lower.split('arxiv:')) == 2
-        case2 = file_lower.startswith('https://arxiv.org/abs') and len(file_lower.split('https://arxiv.org/abs')) == 2
-        case3 = file_lower.startswith('http://arxiv.org/abs') and len(file_lower.split('http://arxiv.org/abs')) == 2
-        case4 = file_lower.startswith('arxiv.org/abs/') and len(file_lower.split('arxiv.org/abs/')) == 2
-        if case1 or case2 or case3 or case4:
-            if case1:
+        if is_arxiv:
+            if case1_arxiv:
                 query = file.lower().split('arxiv:')[1].strip()
-            elif case2:
+            elif case2_arxiv:
                 query = file.lower().split('https://arxiv.org/abs/')[1].strip()
-            elif case2:
+            elif case2_arxiv:
                 query = file.lower().split('http://arxiv.org/abs/')[1].strip()
-            elif case3:
+            elif case3_arxiv:
                 query = file.lower().split('arxiv.org/abs/')[1].strip()
             else:
                 raise RuntimeError("Unexpected arxiv error for %s" % file)
@@ -2093,9 +3410,86 @@ def file_to_doc(file,
                     docs1]
             else:
                 docs1 = []
+            add_meta(docs1, file, parser="is_url")
+            docs1 = clean_doc(docs1)
+            doc1.extend(chunk_sources(docs1))
+        elif is_youtube and (enable_transcriptions or extract_frames > 0 and have_fiftyone):
+            e = None
+            handled = False
+            docs1 = []
+            files_out = []
+            if enable_transcriptions:
+                try:
+                    if model_loaders['asr'] is not None and not isinstance(model_loaders['asr'], (str, bool)):
+                        # assumes didn't fork into this process with joblib, else can deadlock
+                        if verbose:
+                            print("Reuse ASR", flush=True)
+                        model_loaders['asr'].load_model()
+                    else:
+                        if verbose:
+                            print("Fresh ASR", flush=True)
+                        from audio_langchain import H2OAudioCaptionLoader
+                        model_loaders['asr'] = H2OAudioCaptionLoader(asr_model=asr_model,
+                                                                     asr_gpu=model_loaders['asr'] == 'gpu',
+                                                                     gpu_id=asr_gpu_id,
+                                                                     )
+                    model_loaders['asr'].set_audio_paths([file])
+                    docs1c = model_loaders['asr'].load(from_youtube=True)
+                    files_out = model_loaders['asr'].files_out
+                    docs1c = [x for x in docs1c if x.page_content]
+                    add_meta(docs1c, file, parser='H2OAudioCaptionLoader: %s' % asr_model)
+                    # caption didn't set source, so fix-up meta
+                    hash_of_file = hash_file(file)
+                    [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c]
+                    for file_out_i, file_out in enumerate(files_out):
+                        key = 'source_true_' + str(file_out_i)
+                        [doci.metadata.update({key: file_out}) for doci in docs1c]
+                    docs1.extend(docs1c)
+                    doc1.extend(chunk_sources(docs1))
+                    handled = True
+                except BaseException as e0:
+                    print("ASR: %s: %s" % (str(e0), traceback.print_exception(e0)), flush=True)
+                    e = e0
+                handled |= len(docs1) > 0
+            if extract_frames > 0 and have_fiftyone:
+                try:
+                    from src.vision.extract_movie import extract_unique_frames
+                    if not files_out or True:  # always do, seems makes audio m4a not with video when downloads
+                        # have to directly download
+                        export_dir = extract_unique_frames(urls=[file], extract_frames=extract_frames)
+                        docs1c_files = path_to_docs_func(export_dir)
+                    else:
+                        # just use already-downloaded files
+                        docs1c_files = []
+                        for file_out in files_out:
+                            export_dir = extract_unique_frames(file=file_out, extract_frames=extract_frames)
+                            docs1c_files.extend(path_to_docs_func(export_dir))
+                    if os.getenv('FRAMES_AS_SAME_DOC', '0') == '1':
+                        add_meta(docs1c_files, file, parser='extract_frames from %s' % file)
+                        hash_of_file = hash_file(file)
+                        [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c_files]
+                    else:
+                        [x.metadata.update(dict(original_source=file)) for order_id, x in enumerate(docs1c_files)]
+                    docs1c_files = chunk_sources(docs1c_files)
+                    doc1.extend(docs1c_files)
+                except BaseException as e0:
+                    print("Extract YouTube Frames: %s" % str(e0), flush=True)
+                    e = e0
+                handled |= len(docs1) > 0
+            if len(doc1) == 0:
+                # if literally nothing, show failed to parse so user knows, since unlikely nothing in PDF at all.
+                if handled:
+                    raise ValueError("%s had no valid text, but meta data was parsed" % file)
+                else:
+                    raise ValueError("%s had no valid text and no meta data was parsed: %s" % (file, str(e)))
         else:
             if not (file.startswith("http://") or file.startswith("file://") or file.startswith("https://")):
                 file = 'http://' + file
+            url_depth = int(os.getenv('ALL_CRAWL_DEPTH', '0'))
+            if url_depth > 0:
+                final_urls = Crawler(urls=[file], verbose=verbose).run()
+            else:
+                final_urls = [file]
             docs1 = []
             do_unstructured = only_unstructured_urls or use_unstructured
             if only_selenium or only_playwright:
@@ -2107,40 +3501,70 @@ def file_to_doc(file,
             if only_unstructured_urls or only_playwright:
                 do_selenium = False
             if do_unstructured or use_unstructured:
-                docs1a = UnstructuredURLLoader(urls=[file]).load()
-                docs1a = [x for x in docs1a if x.page_content]
+                docs1a = UnstructuredURLLoader(urls=final_urls, headers=dict(ssl_verify="False")).load()
+                docs1a = [x for x in docs1a if
+                          x.page_content and x.page_content != '403 Forbidden' and not x.page_content.startswith(
+                              'Access Denied')]
                 add_parser(docs1a, 'UnstructuredURLLoader')
                 docs1.extend(docs1a)
             if len(docs1) == 0 and have_playwright or do_playwright:
                 # then something went wrong, try another loader:
-                from langchain.document_loaders import PlaywrightURLLoader
-                docs1a = asyncio.run(PlaywrightURLLoader(urls=[file]).aload())
+                from langchain_community.document_loaders import PlaywrightURLLoader
+                docs1a = asyncio.run(PlaywrightURLLoader(urls=final_urls).aload())
                 # docs1 = PlaywrightURLLoader(urls=[file]).load()
-                docs1a = [x for x in docs1a if x.page_content]
+                docs1a = [x for x in docs1a if
+                          x.page_content and x.page_content != '403 Forbidden' and not x.page_content.startswith(
+                              'Access Denied')]
                 add_parser(docs1a, 'PlaywrightURLLoader')
                 docs1.extend(docs1a)
             if len(docs1) == 0 and have_selenium or do_selenium:
                 # then something went wrong, try another loader:
                 # but requires Chrome binary, else get: selenium.common.exceptions.WebDriverException:
                 # Message: unknown error: cannot find Chrome binary
-                from langchain.document_loaders import SeleniumURLLoader
+                from langchain_community.document_loaders import SeleniumURLLoader
                 from selenium.common.exceptions import WebDriverException
                 try:
-                    docs1a = SeleniumURLLoader(urls=[file]).load()
-                    docs1a = [x for x in docs1a if x.page_content]
+                    docs1a = SeleniumURLLoader(urls=final_urls).load()
+                    docs1a = [x for x in docs1a if
+                              x.page_content and x.page_content != '403 Forbidden' and not x.page_content.startswith(
+                                  'Access Denied')]
                     add_parser(docs1a, 'SeleniumURLLoader')
                     docs1.extend(docs1a)
                 except WebDriverException as e:
                     print("No web driver: %s" % str(e), flush=True)
+            if use_scrapehttp or use_scrapeplaywright:
+                docs1a = []
+                if url_depth > 0:
+                    # then already did crawl over depth, just use
+                    pass
+                else:
+                    final_urls = Crawler(urls=[file], verbose=verbose).run()
+                if use_scrapehttp:
+                    loader = AsyncHtmlLoader(final_urls, verify_ssl=False, requests_per_second=10,
+                                             ignore_load_errors=True)
+                    docs1a = loader.load()
+                if use_scrapeplaywright:
+                    loader = AsyncChromiumLoader(final_urls)
+                    docs1a = loader.load()
+                if os.getenv('HTML_TRANS', 'HTML2TEXT') == 'BS4':
+                    bs_transformer = BeautifulSoupTransformer()
+                    # Scrape text content tags such as <p>, <li>, <div>, and <a> tags from the HTML content:
+                    # https://python.langchain.com/docs/use_cases/web_scraping#quickstart
+                    tags_to_extract = ast.literal_eval(os.getenv('BS4_TAGS', '["span"]'))
+                    docs1a = bs_transformer.transform_documents(docs1a, tags_to_extract=tags_to_extract)
+                else:
+                    html2text = Html2TextTransformer()
+                    docs1a = html2text.transform_documents(docs1a)
+                docs1.extend(docs1a)
             [x.metadata.update(dict(input_type='url', date=str(datetime.now))) for x in docs1]
-        add_meta(docs1, file, parser="is_url")
-        docs1 = clean_doc(docs1)
-        doc1 = chunk_sources(docs1)
+            add_meta(docs1, file, parser="is_url")
+            docs1 = clean_doc(docs1)
+            doc1.extend(chunk_sources(docs1))
     elif is_txt:
         base_path = "user_paste"
         base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
         source_file = os.path.join(base_path, "_%s.txt" % str(uuid.uuid4())[:10])
-        with open(source_file, "wt") as f:
+        with open(source_file, "wt", encoding="utf-8") as f:
             f.write(file)
         metadata = dict(source=source_file, date=str(datetime.now()), input_type='pasted txt')
         doc1 = Document(page_content=str(file), metadata=metadata)
@@ -2155,6 +3579,24 @@ def file_to_doc(file,
     elif (file.lower().endswith('.docx') or file.lower().endswith('.doc')) and (have_libreoffice or True):
         docs1 = UnstructuredWordDocumentLoader(file_path=file).load()
         add_meta(docs1, file, parser='UnstructuredWordDocumentLoader')
+        docs1 = [x for x in docs1 if x.page_content]
+        if not docs1:
+            from langchain_community.document_loaders import Docx2txtLoader
+            docs1 = Docx2txtLoader(file_path=file).load()
+            docs1 = [x for x in docs1 if x.page_content]
+            add_meta(docs1, file, parser='Docx2txtLoader')
+        try:
+            # maybe images
+            import docx2txt
+
+            tmpdir = os.path.join(get_gradio_tmp(), str(uuid.uuid4()))
+            makedirs(tmpdir, exist_ok=True)
+            text = docx2txt.process(file, tmpdir)
+            images = os.listdir(tmpdir)
+            docs1 = path_to_docs_func([os.path.join(tmpdir, x) for x in images])
+        except Exception as e:
+            print("docx images failure: %s" % str(e))
+
         doc1 = chunk_sources(docs1)
     elif (file.lower().endswith('.xlsx') or file.lower().endswith('.xls')) and (have_libreoffice or True):
         docs1 = UnstructuredExcelLoader(file_path=file).load()
@@ -2194,92 +3636,216 @@ def file_to_doc(file,
         docs1 = UnstructuredEPubLoader(file).load()
         add_meta(docs1, file, parser='UnstructuredEPubLoader')
         doc1 = chunk_sources(docs1)
-    elif any(file.lower().endswith(x) for x in set_image_types1):
+    elif can_do_audio_transcription or can_do_video_extraction:
+        handled = False
+        e = None
+        if can_do_audio_transcription:
+            docs1c = []
+            try:
+                if model_loaders['asr'] is not None and not isinstance(model_loaders['asr'], (str, bool)):
+                    # assumes didn't fork into this process with joblib, else can deadlock
+                    if verbose:
+                        print("Reuse ASR", flush=True)
+                    model_loaders['asr'].load_model()
+                else:
+                    if verbose:
+                        print("Fresh ASR", flush=True)
+                    from audio_langchain import H2OAudioCaptionLoader
+                    model_loaders['asr'] = H2OAudioCaptionLoader(asr_model=asr_model,
+                                                                 asr_gpu=model_loaders['asr'] == 'gpu',
+                                                                 gpu_id=asr_gpu_id,
+                                                                 )
+                model_loaders['asr'].set_audio_paths([file])
+                docs1c = model_loaders['asr'].load(from_youtube=False)
+                docs1c = [x for x in docs1c if x.page_content]
+                add_meta(docs1c, file, parser='H2OAudioCaptionLoader: %s' % asr_model)
+                files_out = model_loaders['asr'].files_out
+                for file_out_i, file_out in enumerate(files_out):
+                    key = 'source_true_' + str(file_out_i)
+                    [doci.metadata.update({key: file_out}) for doci in docs1c]
+                hash_of_file = hash_file(file)
+                [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c]
+                docs1c = chunk_sources(docs1c)
+                # caption didn't set source, so fix-up meta
+                doc1.extend(docs1c)
+            except BaseException as e0:
+                print("ASR2: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(docs1c) > 0
+
+        if can_do_video_extraction:
+            docs1c_files = []
+            try:
+                from src.vision.extract_movie import extract_unique_frames
+                export_dir = extract_unique_frames(file=file, extract_frames=extract_frames)
+                docs1c_files = path_to_docs_func(export_dir)
+                if os.getenv('FRAMES_AS_SAME_DOC', '0') == '1':
+                    add_meta(docs1c_files, file, parser='extract_frames from %s' % file)
+                    hash_of_file = hash_file(file)
+                    [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c_files]
+                else:
+                    [x.metadata.update(dict(original_source=file)) for order_id, x in enumerate(docs1c_files)]
+                doc1.extend(docs1c_files)
+            except BaseException as e0:
+                print("Extract YouTube Frames: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(docs1c_files) > 0
+        if len(doc1) == 0:
+            # if literally nothing, show failed to parse so user knows, since unlikely nothing in PDF at all.
+            if handled:
+                raise ValueError("%s had no valid text, but meta data was parsed" % file)
+            else:
+                raise ValueError("%s had no valid text and no meta data was parsed: %s" % (file, str(e)))
+    elif any(file.lower().endswith(x) for x in set_image_audio_types1):
+        handled = False
+        e = None
         docs1 = []
-        if verbose:
-            print("BEGIN: Tesseract", flush=True)
         if have_tesseract and enable_ocr:
-            # OCR, somewhat works, but not great
-            docs1a = UnstructuredImageLoader(file, strategy='ocr_only').load()
-            # docs1a = UnstructuredImageLoader(file, strategy='hi_res').load()
-            docs1a = [x for x in docs1a if x.page_content]
-            add_meta(docs1a, file, parser='UnstructuredImageLoader')
-            docs1.extend(docs1a)
-        if verbose:
-            print("END: Tesseract", flush=True)
+            file_ocr = fix_image_file(file, do_align=True, do_rotate=True, do_pad=False)
+            if verbose:
+                print("BEGIN: Tesseract", flush=True)
+            try:
+                # OCR, somewhat works, but not great
+                docs1a = UnstructuredImageLoader(file_ocr, strategy='ocr_only').load()
+                # docs1a = UnstructuredImageLoader(file, strategy='hi_res').load()
+                docs1a = [x for x in docs1a if x.page_content]
+                add_meta(docs1a, file, parser='UnstructuredImageLoader', file_as_source=True)
+                [doci.metadata.update(source_true=file_ocr) for doci in docs1a]
+                docs1.extend(docs1a)
+            except BaseException as e0:
+                print("UnstructuredImageLoader: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(docs1) > 0
+            if verbose:
+                print("END: Tesseract", flush=True)
         if have_doctr and enable_doctr:
+            file_doctr = fix_image_file(file, do_align=True, do_rotate=True, do_pad=True)
             if verbose:
                 print("BEGIN: DocTR", flush=True)
-            if model_loaders['doctr'] is not None and not isinstance(model_loaders['doctr'], (str, bool)):
-                if verbose:
-                    print("Reuse DocTR", flush=True)
-                model_loaders['doctr'].load_model()
-            else:
-                if verbose:
-                    print("Fresh DocTR", flush=True)
-                from image_doctr import H2OOCRLoader
-                model_loaders['doctr'] = H2OOCRLoader(layout_aware=True)
-            model_loaders['doctr'].set_document_paths([file])
-            docs1c = model_loaders['doctr'].load()
-            docs1c = [x for x in docs1c if x.page_content]
-            add_meta(docs1c, file, parser='H2OOCRLoader: %s' % 'DocTR')
-            # caption didn't set source, so fix-up meta
-            hash_of_file = hash_file(file)
-            [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c]
-            docs1.extend(docs1c)
+            try:
+                if model_loaders['doctr'] is not None and not isinstance(model_loaders['doctr'], (str, bool)):
+                    if verbose:
+                        print("Reuse DocTR", flush=True)
+                    model_loaders['doctr'].load_model()
+                else:
+                    if verbose:
+                        print("Fresh DocTR", flush=True)
+                    from image_doctr import H2OOCRLoader
+                    model_loaders['doctr'] = H2OOCRLoader(layout_aware=True)
+                model_loaders['doctr'].set_document_paths([file_doctr])
+                docs1c = model_loaders['doctr'].load()
+                docs1c = [x for x in docs1c if x.page_content]
+                add_meta(docs1c, file, parser='H2OOCRLoader: %s' % 'DocTR', file_as_source=True)
+                # caption didn't set source, so fix-up meta
+                hash_of_file = hash_file(file)
+                [doci.metadata.update(source=file, source_true=file_doctr, hashid=hash_of_file) for doci in docs1c]
+                docs1.extend(docs1c)
+            except BaseException as e0:
+                print("H2OOCRLoader: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(docs1) > 0
             if verbose:
                 print("END: DocTR", flush=True)
         if enable_captions:
+            file_blip = fix_image_file(file, do_align=False, do_rotate=False, do_pad=False)
             # BLIP
             if verbose:
                 print("BEGIN: BLIP", flush=True)
-            if model_loaders['caption'] is not None and not isinstance(model_loaders['caption'], (str, bool)):
-                # assumes didn't fork into this process with joblib, else can deadlock
-                if verbose:
-                    print("Reuse BLIP", flush=True)
-                model_loaders['caption'].load_model()
-            else:
-                if verbose:
-                    print("Fresh BLIP", flush=True)
-                from image_captions import H2OImageCaptionLoader
-                model_loaders['caption'] = H2OImageCaptionLoader(caption_gpu=model_loaders['caption'] == 'gpu',
-                                                                 blip_model=captions_model,
-                                                                 blip_processor=captions_model)
-            model_loaders['caption'].set_image_paths([file])
-            docs1c = model_loaders['caption'].load()
-            docs1c = [x for x in docs1c if x.page_content]
-            add_meta(docs1c, file, parser='H2OImageCaptionLoader: %s' % captions_model)
-            # caption didn't set source, so fix-up meta
-            hash_of_file = hash_file(file)
-            [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c]
-            docs1.extend(docs1c)
+            try:
+                if model_loaders['caption'] is not None and not isinstance(model_loaders['caption'], (str, bool)):
+                    # assumes didn't fork into this process with joblib, else can deadlock
+                    if verbose:
+                        print("Reuse BLIP", flush=True)
+                    model_loaders['caption'].load_model()
+                else:
+                    if verbose:
+                        print("Fresh BLIP", flush=True)
+                    from image_captions import H2OImageCaptionLoader
+                    model_loaders['caption'] = H2OImageCaptionLoader(caption_gpu=model_loaders['caption'] == 'gpu',
+                                                                     blip_model=captions_model,
+                                                                     blip_processor=captions_model)
+                model_loaders['caption'].set_image_paths([file_blip])
+                docs1c = model_loaders['caption'].load()
+                docs1c = [x for x in docs1c if x.page_content]
+                add_meta(docs1c, file, parser='H2OImageCaptionLoader: %s' % captions_model, file_as_source=True)
+                # caption didn't set source, so fix-up meta
+                hash_of_file = hash_file(file)
+                [doci.metadata.update(source=file, source_true=file_blip, hashid=hash_of_file) for doci in docs1c]
+                docs1.extend(docs1c)
+            except BaseException as e0:
+                print("H2OImageCaptionLoader: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(docs1) > 0
 
             if verbose:
                 print("END: BLIP", flush=True)
         if enable_pix2struct:
-            # BLIP
+            file_pix = fix_image_file(file, do_align=True, do_rotate=True, do_pad=False)
+            # PIX
             if verbose:
                 print("BEGIN: Pix2Struct", flush=True)
-            if model_loaders['pix2struct'] is not None and not isinstance(model_loaders['pix2struct'], (str, bool)):
-                if verbose:
-                    print("Reuse pix2struct", flush=True)
-                model_loaders['pix2struct'].load_model()
-            else:
-                if verbose:
-                    print("Fresh pix2struct", flush=True)
-                from image_pix2struct import H2OPix2StructLoader
-                model_loaders['pix2struct'] = H2OPix2StructLoader()
-            model_loaders['pix2struct'].set_image_paths([file])
-            docs1c = model_loaders['pix2struct'].load()
-            docs1c = [x for x in docs1c if x.page_content]
-            add_meta(docs1c, file, parser='H2OPix2StructLoader: %s' % model_loaders['pix2struct'])
-            # caption didn't set source, so fix-up meta
-            hash_of_file = hash_file(file)
-            [doci.metadata.update(source=file, hashid=hash_of_file) for doci in docs1c]
-            docs1.extend(docs1c)
+            try:
+                if model_loaders['pix2struct'] is not None and not isinstance(model_loaders['pix2struct'], (str, bool)):
+                    if verbose:
+                        print("Reuse pix2struct", flush=True)
+                    model_loaders['pix2struct'].load_model()
+                else:
+                    if verbose:
+                        print("Fresh pix2struct", flush=True)
+                    from image_pix2struct import H2OPix2StructLoader
+                    model_loaders['pix2struct'] = H2OPix2StructLoader()
+                model_loaders['pix2struct'].set_image_paths([file_pix])
+                docs1c = model_loaders['pix2struct'].load()
+                docs1c = [x for x in docs1c if x.page_content]
+                add_meta(docs1c, file, parser='H2OPix2StructLoader: %s' % model_loaders['pix2struct'],
+                         file_as_source=True)
+                # caption didn't set source, so fix-up meta
+                hash_of_file = hash_file(file)
+                [doci.metadata.update(source=file, source_true=file_pix, hashid=hash_of_file) for doci in docs1c]
+                docs1.extend(docs1c)
+            except BaseException as e0:
+                print("H2OPix2StructLoader: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(docs1) > 0
             if verbose:
                 print("END: Pix2Struct", flush=True)
+        if llava_model and enable_llava:
+            file_llava = fix_image_file(file, do_align=True, do_rotate=True, do_pad=False)
+            # LLaVa
+            if verbose:
+                print("BEGIN: LLaVa", flush=True)
+            try:
+                from src.vision.utils_vision import get_llava_response
+                res, llava_prompt = get_llava_response(file_llava, llava_model,
+                                                       prompt=llava_prompt,
+                                                       allow_prompt_auto=True,
+                                                       max_time=60,  # not too much time for docQA
+                                                       verbose=verbose,
+                                                       )
+                metadata = dict(source=file, date=str(datetime.now()), input_type='LLaVa')
+                docs1c = [Document(page_content=res, metadata=metadata)]
+                docs1c = [x for x in docs1c if x.page_content]
+                add_meta(docs1c, file, parser='LLaVa: %s' % llava_model, file_as_source=True)
+                # caption didn't set source, so fix-up meta
+                hash_of_file = hash_file(file)
+                [doci.metadata.update(source=file, source_true=file_llava, hashid=hash_of_file,
+                                      llava_prompt=llava_prompt or '') for doci in
+                 docs1c]
+                docs1.extend(docs1c)
+            except BaseException as e0:
+                print("LLaVa: %s: %s" % (str(e0), traceback.print_exception(e0)), flush=True)
+                e = e0
+            handled |= len(docs1) > 0
+            if verbose:
+                print("END: LLaVa", flush=True)
+
         doc1 = chunk_sources(docs1)
+        if len(doc1) == 0:
+            # if literally nothing, show failed to parse so user knows, since unlikely nothing in PDF at all.
+            if handled:
+                raise ValueError("%s had no valid text, but meta data was parsed" % file)
+            else:
+                raise ValueError("%s had no valid text and no meta data was parsed: %s" % (file, str(e)))
     elif file.lower().endswith('.msg'):
         raise RuntimeError("Not supported, GPL3 license")
         # docs1 = OutlookMessageLoader(file).load()
@@ -2323,9 +3889,19 @@ def file_to_doc(file,
             jq_schema=jq_schema,
             text_content=False,
             metadata_func=json_metadata_func)
-        doc1 = loader.load()
-        add_meta(doc1, file, parser='JSONLoader: %s' % jq_schema)
-        fix_json_meta(doc1)
+        try:
+            doc1 = loader.load()
+            add_meta(doc1, file, parser='JSONLoader: %s' % jq_schema)
+            fix_json_meta(doc1)
+        except Exception as e:
+            if os.getenv("TRYJSONASTEXT", '1') == '0':
+                raise
+            # revert to treating as text
+            metadata = dict(source=file, date=str(datetime.now()), input_type='JSONAsText')
+            with open(file, "r") as f:
+                doc1 = Document(page_content=str(f.read()), metadata=metadata)
+            add_meta(doc1, file, parser='JSONAsTextLoader: json failed with: %s' % str(e))
+        doc1 = chunk_sources(doc1)
     elif file.lower().endswith('.jsonl'):
         loader = JSONLoader(
             file_path=file,
@@ -2334,9 +3910,19 @@ def file_to_doc(file,
             json_lines=True,
             text_content=False,
             metadata_func=json_metadata_func)
-        doc1 = loader.load()
-        add_meta(doc1, file, parser='JSONLoader: %s' % jq_schema)
-        fix_json_meta(doc1)
+        try:
+            doc1 = loader.load()
+            add_meta(doc1, file, parser='JSONLLoader: %s' % jq_schema)
+            fix_json_meta(doc1)
+        except Exception as e:
+            if os.getenv("TRYJSONASTEXT", '1') == '0':
+                raise
+            # revert to treating as text
+            metadata = dict(source=file, date=str(datetime.now()), input_type='JSONLAsText')
+            with open(file, "r") as f:
+                doc1 = Document(page_content=str(f.read()), metadata=metadata)
+            add_meta(doc1, file, parser='JSONLAsTextLoader: jsonl failed with: %s' % str(e))
+        doc1 = chunk_sources(doc1)
     elif file.lower().endswith('.pdf'):
         # migration
         if isinstance(use_pymupdf, bool):
@@ -2375,7 +3961,7 @@ def file_to_doc(file,
         e = None
         if have_pymupdf and (len(doc1) == 0 and use_pymupdf == 'auto' or use_pymupdf == 'on'):
             # GPL, only use if installed
-            from langchain.document_loaders import PyMuPDFLoader
+            from langchain_community.document_loaders import PyMuPDFLoader
             # load() still chunks by pages, but every page has title at start to help
             try:
                 doc1a = PyMuPDFLoader(file).load()
@@ -2389,6 +3975,23 @@ def file_to_doc(file,
             doc1a = [x for x in doc1a if x.page_content]
             doc1a = clean_doc(doc1a)
             add_parser(doc1a, 'PyMuPDFLoader')
+            doc1.extend(doc1a)
+        # PyPDF is first if PyMuPDF not installed
+        if len(doc1) == 0 and use_pypdf == 'auto' or use_pypdf == 'on':
+            tried_others = True
+            # open-source fallback
+            # load() still chunks by pages, but every page has title at start to help
+            try:
+                doc1a = PyPDFLoader(file).load()
+            except BaseException as e0:
+                doc1a = []
+                print("PyPDFLoader: %s" % str(e0), flush=True)
+                e = e0
+            handled |= len(doc1a) > 0
+            # remove empty documents
+            doc1a = [x for x in doc1a if x.page_content]
+            doc1a = clean_doc(doc1a)
+            add_parser(doc1a, 'PyPDFLoader')
             doc1.extend(doc1a)
         # do OCR/tesseract if only 2 page and auto, since doctr superior and faster
         if (len(doc1) == 0 or num_pages is not None and num_pages < 2) and use_unstructured_pdf == 'auto' \
@@ -2407,26 +4010,10 @@ def file_to_doc(file,
             add_parser(doc1a, 'UnstructuredPDFLoader')
             # seems to not need cleaning in most cases
             doc1.extend(doc1a)
-        if len(doc1) == 0 and use_pypdf == 'auto' or use_pypdf == 'on':
-            tried_others = True
-            # open-source fallback
-            # load() still chunks by pages, but every page has title at start to help
-            try:
-                doc1a = PyPDFLoader(file).load()
-            except BaseException as e0:
-                doc1a = []
-                print("PyPDFLoader: %s" % str(e0), flush=True)
-                e = e0
-            handled |= len(doc1a) > 0
-            # remove empty documents
-            doc1a = [x for x in doc1a if x.page_content]
-            doc1a = clean_doc(doc1a)
-            add_parser(doc1a, 'PyPDFLoader')
-            doc1.extend(doc1a)
         if not did_pymupdf and ((have_pymupdf and len(doc1) == 0) and tried_others):
             # try again in case only others used, but only if didn't already try (2nd part of and)
             # GPL, only use if installed
-            from langchain.document_loaders import PyMuPDFLoader
+            from langchain_community.document_loaders import PyMuPDFLoader
             # load() still chunks by pages, but every page has title at start to help
             try:
                 doc1a = PyMuPDFLoader(file).load()
@@ -2445,7 +4032,12 @@ def file_to_doc(file,
             did_pdf_ocr = True
             # no did_unstructured condition here because here we do OCR, and before we did not
             # try OCR in end since slowest, but works on pure image pages well
-            doc1a = UnstructuredPDFLoader(file, strategy='ocr_only').load()
+            try:
+                doc1a = UnstructuredPDFLoader(file, strategy='ocr_only').load()
+            except BaseException as e0:
+                doc1a = []
+                print("UnstructuredPDFLoader: %s" % str(e0), flush=True)
+                e = e0
             handled |= len(doc1a) > 0
             # remove empty documents
             doc1a = [x for x in doc1a if x.page_content]
@@ -2454,7 +4046,7 @@ def file_to_doc(file,
             doc1.extend(doc1a)
         # Some PDFs return nothing or junk from PDFMinerLoader
         # if auto, do doctr pdf if not too many pages, else can be slow/expensive
-        if (len(doc1) == 0 or num_pages is not None and num_pages < 100) and enable_pdf_doctr == 'auto' or \
+        if (len(doc1) == 0 or num_pages is not None and num_pages < 5) and enable_pdf_doctr == 'auto' or \
                 enable_pdf_doctr == 'on':
             if verbose:
                 print("BEGIN: DocTR", flush=True)
@@ -2467,12 +4059,18 @@ def file_to_doc(file,
             try:
                 pages = get_each_page(file)
                 got_pages = True
-            except:
+            except Exception as e:
                 # FIXME: protection for now, unsure how generally will work
+                print("Exception in doctr page handling: %s" % str(e), flush=True)
                 pages = [file]
                 got_pages = False
-            model_loaders['doctr'].set_document_paths(pages)
-            doc1a = model_loaders['doctr'].load()
+            try:
+                model_loaders['doctr'].set_document_paths(pages)
+                doc1a = model_loaders['doctr'].load()
+            except BaseException as e0:
+                doc1a = []
+                print("H2OOCRLoader: %s" % str(e0), flush=True)
+                e = e0
             doc1a = [x for x in doc1a if x.page_content]
             add_meta(doc1a, file, parser='H2OOCRLoader: %s' % 'DocTR')
             handled |= len(doc1a) > 0
@@ -2522,7 +4120,7 @@ def file_to_doc(file,
         add_meta(doc1, file, parser='TomlLoader')
         doc1 = chunk_sources(doc1)
     elif file.lower().endswith('.xml'):
-        from langchain.document_loaders import UnstructuredXMLLoader
+        from langchain_community.document_loaders import UnstructuredXMLLoader
         loader = UnstructuredXMLLoader(file_path=file)
         doc1 = loader.load()
         add_meta(doc1, file, parser='UnstructuredXMLLoader')
@@ -2538,6 +4136,13 @@ def file_to_doc(file,
             zip_ref.extractall(base_path)
             # recurse
             doc1 = path_to_docs_func(base_path)
+    elif file.lower().endswith('.tar.gz') or file.lower().endswith('.tgz'):
+        with tarfile.open(file, 'r') as tar_ref:
+            # don't put into temporary path, since want to keep references to docs inside tar.gz
+            # so just extract in path where
+            tar_ref.extractall(base_path)
+            # recurse
+            doc1 = path_to_docs_func(base_path)
     elif file.lower().endswith('.gz') or file.lower().endswith('.gzip'):
         if file.lower().endswith('.gz'):
             de_file = file.lower().replace('.gz', '')
@@ -2547,39 +4152,10 @@ def file_to_doc(file,
             with open(de_file, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
         # recurse
-        doc1 = file_to_doc(de_file,
-                           filei=filei,  # single file, same file index as outside caller
-                           base_path=base_path, verbose=verbose, fail_any_exception=fail_any_exception,
-                           chunk=chunk, chunk_size=chunk_size, n_jobs=n_jobs,
-                           is_url=is_url, is_txt=is_txt,
+        doc1 = path_to_docs_func(de_file,
+                                 filei=filei,  # single file, same file index as outside caller
+                                 )
 
-                           # urls
-                           use_unstructured=use_unstructured,
-                           use_playwright=use_playwright,
-                           use_selenium=use_selenium,
-
-                           # pdfs
-                           use_pymupdf=use_pymupdf,
-                           use_unstructured_pdf=use_unstructured_pdf,
-                           use_pypdf=use_pypdf,
-                           enable_pdf_ocr=enable_pdf_ocr,
-                           enable_pdf_doctr=enable_pdf_doctr,
-                           try_pdf_as_html=try_pdf_as_html,
-
-                           # images
-                           enable_ocr=enable_ocr,
-                           enable_doctr=enable_doctr,
-                           enable_pix2struct=enable_pix2struct,
-                           enable_captions=enable_captions,
-                           captions_model=captions_model,
-                           model_loaders=model_loaders,
-
-                           # json
-                           jq_schema=jq_schema,
-
-                           headsize=headsize,
-                           db_type=db_type,
-                           selected_file_types=selected_file_types)
     else:
         raise RuntimeError("No file handler for %s" % os.path.basename(file))
 
@@ -2587,13 +4163,30 @@ def file_to_doc(file,
     if not isinstance(doc1, list):
         # If not list, did not chunk yet, so chunk now
         docs = chunk_sources([doc1])
-    elif isinstance(doc1, list) and len(doc1) == 1:
-        # if list of length one, don't trust and chunk it, chunk_id's will still be correct if repeat
-        docs = chunk_sources(doc1)
     else:
-        docs = doc1
+        if len(doc1) == 1:
+            # if list of length one, don't trust and chunk it, chunk_id's will still be correct if repeat
+            docs = chunk_sources(doc1)
+        elif doc1 and doc1[0].metadata.get('chunk_id') is None:
+            if os.getenv('HARD_ASSERTS'):
+                raise ValueError("Did not set chunk_id: %s" % str(doc1))
+            docs = chunk_sources(doc1)
+        else:
+            docs = doc1
 
     assert isinstance(docs, list)
+
+    if orig_url is not None:
+        # go back to URL as source
+        [doci.metadata.update(source=orig_url) for doci in doc1]
+
+    if is_public:
+        if len(docs) > max_chunks_per_doc_public and from_ui or \
+                len(docs) > max_chunks_per_doc_public_api and not from_ui:
+            raise ValueError("Public instance only allows up to"
+                             " %s (%s from API) chunks "
+                             "per document." % (max_chunks_per_doc_public, max_chunks_per_doc_public_api))
+
     return docs
 
 
@@ -2608,6 +4201,8 @@ def path_to_doc1(file,
                  use_unstructured=True,
                  use_playwright=False,
                  use_selenium=False,
+                 use_scrapeplaywright=False,
+                 use_scrapehttp=False,
 
                  # pdfs
                  use_pymupdf='auto',
@@ -2622,17 +4217,31 @@ def path_to_doc1(file,
                  enable_doctr=False,
                  enable_pix2struct=False,
                  enable_captions=True,
+                 enable_llava=True,
+                 enable_transcriptions=True,
                  captions_model=None,
-                 model_loaders=None,
+                 llava_model=None,
+                 asr_model=None,
 
                  # json
                  jq_schema='.[]',
+                 extract_frames=10,
+                 llava_prompt=None,
 
+                 model_loaders=None,
+
+                 headsize=50,
                  db_type=None,
-                 selected_file_types=None):
+                 selected_file_types=None,
+
+                 is_public=False,
+                 from_ui=True,
+                 ):
     assert db_type is not None
     if verbose:
-        if is_url:
+        if is_url and is_txt:
+            print("Ingesting URL or Text: %s" % file, flush=True)
+        elif is_url:
             print("Ingesting URL: %s" % file, flush=True)
         elif is_txt:
             print("Ingesting Text: %s" % file, flush=True)
@@ -2643,7 +4252,8 @@ def path_to_doc1(file,
         # don't pass base_path=path, would infinitely recurse
         res = file_to_doc(file,
                           filei=filei,
-                          base_path=None, verbose=verbose, fail_any_exception=fail_any_exception,
+                          base_path=None,
+                          verbose=verbose, fail_any_exception=fail_any_exception,
                           chunk=chunk, chunk_size=chunk_size,
                           n_jobs=n_jobs,
                           is_url=is_url, is_txt=is_txt,
@@ -2652,6 +4262,8 @@ def path_to_doc1(file,
                           use_unstructured=use_unstructured,
                           use_playwright=use_playwright,
                           use_selenium=use_selenium,
+                          use_scrapeplaywright=use_scrapeplaywright,
+                          use_scrapehttp=use_scrapehttp,
 
                           # pdfs
                           use_pymupdf=use_pymupdf,
@@ -2666,14 +4278,27 @@ def path_to_doc1(file,
                           enable_doctr=enable_doctr,
                           enable_pix2struct=enable_pix2struct,
                           enable_captions=enable_captions,
+                          enable_llava=enable_llava,
+                          enable_transcriptions=enable_transcriptions,
                           captions_model=captions_model,
+                          llava_model=llava_model,
+                          llava_prompt=llava_prompt,
+                          asr_model=asr_model,
+
                           model_loaders=model_loaders,
 
                           # json
                           jq_schema=jq_schema,
 
+                          # video
+                          extract_frames=extract_frames,
+
+                          headsize=headsize,
                           db_type=db_type,
-                          selected_file_types=selected_file_types)
+                          selected_file_types=selected_file_types,
+                          is_public=is_public,
+                          from_ui=from_ui,
+                          )
     except BaseException as e:
         print("Failed to ingest %s due to %s" % (file, traceback.format_exc()))
         if fail_any_exception:
@@ -2685,7 +4310,9 @@ def path_to_doc1(file,
                           "traceback": traceback.format_exc()})
             res = [exception_doc]
     if verbose:
-        if is_url:
+        if is_url and is_txt:
+            print("DONE Ingesting URL or Text: %s" % file, flush=True)
+        elif is_url:
             print("DONE Ingesting URL: %s" % file, flush=True)
         elif is_txt:
             print("DONE Ingesting Text: %s" % file, flush=True)
@@ -2702,14 +4329,19 @@ def path_to_doc1(file,
     return res
 
 
-def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=-1,
-                 chunk=True, chunk_size=512,
+def path_to_docs(path_or_paths,
+                 filei=None,
                  url=None, text=None,
+
+                 verbose=False, fail_any_exception=False, n_jobs=-1,
+                 chunk=True, chunk_size=512,
 
                  # urls
                  use_unstructured=True,
                  use_playwright=False,
                  use_selenium=False,
+                 use_scrapeplaywright=False,
+                 use_scrapehttp=False,
 
                  # pdfs
                  use_pymupdf='auto',
@@ -2724,36 +4356,49 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
                  enable_doctr=False,
                  enable_pix2struct=False,
                  enable_captions=True,
+                 enable_llava=True,
+                 enable_transcriptions=True,
                  captions_model=None,
+                 llava_model=None,
+                 llava_prompt=None,
+                 asr_model=None,
 
                  caption_loader=None,
                  doctr_loader=None,
                  pix2struct_loader=None,
+                 asr_loader=None,
 
                  # json
                  jq_schema='.[]',
+                 # video
+                 extract_frames=10,
+
+                 db_type=None,
+                 is_public=False,
 
                  existing_files=[],
                  existing_hash_ids={},
-                 db_type=None,
                  selected_file_types=None,
+
+                 from_ui=True,
                  ):
     if verbose:
         print("BEGIN Consuming path_or_paths=%s url=%s text=%s" % (path_or_paths, url, text), flush=True)
     if selected_file_types is not None:
-        non_image_types1 = [x for x in non_image_types if x in selected_file_types]
-        image_types1 = [x for x in image_types if x in selected_file_types]
+        non_image_audio_types1 = [x for x in non_image_types if x in selected_file_types]
+        image_audio_types1 = [x for x in image_types + audio_types if x in selected_file_types]
     else:
-        non_image_types1 = non_image_types.copy()
-        image_types1 = image_types.copy()
+        non_image_audio_types1 = non_image_types.copy()
+        image_audio_types1 = image_types.copy() + audio_types.copy()
 
     assert db_type is not None
     # path_or_paths could be str, list, tuple, generator
-    globs_image_types = []
+    globs_image_audio_types = []
     globs_non_image_types = []
     if not path_or_paths and not url and not text:
         return []
     elif url:
+        # ok if text too
         url = get_list_or_str(url)
         globs_non_image_types = url if isinstance(url, (list, tuple, types.GeneratorType)) else [url]
     elif text:
@@ -2762,11 +4407,11 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
         # single path, only consume allowed files
         path = path_or_paths
         # Below globs should match patterns in file_to_doc()
-        [globs_image_types.extend(glob.glob(os.path.join(path, "./**/*.%s" % ftype), recursive=True))
-         for ftype in image_types1]
-        globs_image_types = [os.path.normpath(x) for x in globs_image_types]
+        [globs_image_audio_types.extend(glob.glob(os.path.join(path, "./**/*.%s" % ftype), recursive=True))
+         for ftype in image_audio_types1]
+        globs_image_audio_types = [os.path.normpath(x) for x in globs_image_audio_types]
         [globs_non_image_types.extend(glob.glob(os.path.join(path, "./**/*.%s" % ftype), recursive=True))
-         for ftype in non_image_types1]
+         for ftype in non_image_audio_types1]
         globs_non_image_types = [os.path.normpath(x) for x in globs_non_image_types]
     else:
         if isinstance(path_or_paths, str):
@@ -2779,37 +4424,41 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
         assert isinstance(path_or_paths, (list, tuple, types.GeneratorType)), \
             "Wrong type for path_or_paths: %s %s" % (path_or_paths, type(path_or_paths))
         # reform out of allowed types
-        globs_image_types.extend(
-            flatten_list([[os.path.normpath(x) for x in path_or_paths if x.endswith(y)] for y in image_types1]))
+        globs_image_audio_types.extend(
+            flatten_list([[os.path.normpath(x) for x in path_or_paths if x.endswith(y)] for y in image_audio_types1]))
         # could do below:
-        # globs_non_image_types = flatten_list([[x for x in path_or_paths if x.endswith(y)] for y in non_image_types1])
+        # globs_non_image_types = flatten_list([[x for x in path_or_paths if x.endswith(y)] for y in non_image_audio_types1])
         # But instead, allow fail so can collect unsupported too
-        set_globs_image_types = set(globs_image_types)
-        globs_non_image_types.extend([os.path.normpath(x) for x in path_or_paths if x not in set_globs_image_types])
+        set_globs_image_audio_types = set(globs_image_audio_types)
+        globs_non_image_types.extend(
+            [os.path.normpath(x) for x in path_or_paths if x not in set_globs_image_audio_types])
 
     # filter out any files to skip (e.g. if already processed them)
     # this is easy, but too aggressive in case a file changed, so parent probably passed existing_files=[]
     assert not existing_files, "DEV: assume not using this approach"
     if existing_files:
         set_skip_files = set(existing_files)
-        globs_image_types = [x for x in globs_image_types if x not in set_skip_files]
+        globs_image_audio_types = [x for x in globs_image_audio_types if x not in set_skip_files]
         globs_non_image_types = [x for x in globs_non_image_types if x not in set_skip_files]
     if existing_hash_ids:
         # assume consistent with add_meta() use of hash_file(file)
         # also assume consistent with get_existing_hash_ids for dict creation
         # assume hashable values
         existing_hash_ids_set = set(existing_hash_ids.items())
-        hash_ids_all_image = set({x: hash_file(x) for x in globs_image_types}.items())
+        hash_ids_all_image_audio = set({x: hash_file(x) for x in globs_image_audio_types}.items())
         hash_ids_all_non_image = set({x: hash_file(x) for x in globs_non_image_types}.items())
         # don't use symmetric diff.  If file is gone, ignore and don't remove or something
         #  just consider existing files (key) having new hash or not (value)
-        new_files_image = set(dict(hash_ids_all_image - existing_hash_ids_set).keys())
+        new_files_image_audio = set(dict(hash_ids_all_image_audio - existing_hash_ids_set).keys())
         new_files_non_image = set(dict(hash_ids_all_non_image - existing_hash_ids_set).keys())
-        globs_image_types = [x for x in globs_image_types if x in new_files_image]
+        globs_image_audio_types = [x for x in globs_image_audio_types if x in new_files_image_audio]
         globs_non_image_types = [x for x in globs_non_image_types if x in new_files_non_image]
 
     # could use generator, but messes up metadata handling in recursive case
+    # FIXME: n_gpus=n_gpus?
     if caption_loader and not isinstance(caption_loader, (bool, str)) and caption_loader.device != 'cpu' or \
+            get_device() == 'cuda' or \
+            asr_loader and not isinstance(asr_loader, (bool, str)) and asr_loader.pipe.device != 'cpu' or \
             get_device() == 'cuda':
         # to avoid deadlocks, presume was preloaded and so can't fork due to cuda context
         # get_device() == 'cuda' because presume faster to process image from (temporarily) preloaded model
@@ -2826,7 +4475,8 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
     is_txt = text is not None
     model_loaders = dict(caption=caption_loader,
                          doctr=doctr_loader,
-                         pix2struct=pix2struct_loader)
+                         pix2struct=pix2struct_loader,
+                         asr=asr_loader)
     model_loaders0 = model_loaders.copy()
     kwargs = dict(verbose=verbose, fail_any_exception=fail_any_exception,
                   return_file=return_file,
@@ -2839,6 +4489,8 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
                   use_unstructured=use_unstructured,
                   use_playwright=use_playwright,
                   use_selenium=use_selenium,
+                  use_scrapeplaywright=use_scrapeplaywright,
+                  use_scrapehttp=use_scrapehttp,
 
                   # pdfs
                   use_pymupdf=use_pymupdf,
@@ -2853,35 +4505,62 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
                   enable_doctr=enable_doctr,
                   enable_pix2struct=enable_pix2struct,
                   enable_captions=enable_captions,
+                  enable_llava=enable_llava,
+                  enable_transcriptions=enable_transcriptions,
                   captions_model=captions_model,
+                  llava_model=llava_model,
+                  llava_prompt=llava_prompt,
+                  asr_model=asr_model,
+
                   model_loaders=model_loaders,
 
                   # json
                   jq_schema=jq_schema,
+                  extract_frames=extract_frames,
 
                   db_type=db_type,
                   selected_file_types=selected_file_types,
+
+                  is_public=is_public,
+                  from_ui=from_ui,
                   )
+
+    if is_public:
+        n_docs = len(globs_non_image_types) + len(globs_image_audio_types)
+        if n_docs > max_docs_public and from_ui or \
+                n_docs > max_docs_public_api and not from_ui:
+            raise ValueError(
+                "Public instance only allows up to %d documents "
+                "(including in zip) (%d for API) updated at a time." % (max_docs_public, max_docs_public_api))
+
+    def no_tqdm(x):
+        return x
+
+    my_tqdm = no_tqdm if not verbose else tqdm
+    filei0 = filei
+
     if n_jobs != 1 and len(globs_non_image_types) > 1:
         # avoid nesting, e.g. upload 1 zip and then inside many files
         # harder to handle if upload many zips with many files, inner parallel one will be disabled by joblib
         documents = ProgressParallel(n_jobs=n_jobs, verbose=10 if verbose else 0, backend='multiprocessing')(
-            delayed(path_to_doc1)(file, filei=filei, **kwargs) for filei, file in enumerate(globs_non_image_types)
+            delayed(path_to_doc1)(file, filei=filei0 or filei, **kwargs) for filei, file in
+            enumerate(globs_non_image_types)
         )
     else:
-        documents = [path_to_doc1(file, filei=filei, **kwargs) for filei, file in
-                     enumerate(tqdm(globs_non_image_types))]
+        documents = [path_to_doc1(file, filei=filei0 or filei, **kwargs) for filei, file in
+                     enumerate(my_tqdm(globs_non_image_types))]
 
     # do images separately since can't fork after cuda in parent, so can't be parallel
-    if n_jobs_image != 1 and len(globs_image_types) > 1:
+    if n_jobs_image != 1 and len(globs_image_audio_types) > 1:
         # avoid nesting, e.g. upload 1 zip and then inside many files
         # harder to handle if upload many zips with many files, inner parallel one will be disabled by joblib
         image_documents = ProgressParallel(n_jobs=n_jobs, verbose=10 if verbose else 0, backend='multiprocessing')(
-            delayed(path_to_doc1)(file, filei=filei, **kwargs) for filei, file in enumerate(globs_image_types)
+            delayed(path_to_doc1)(file, filei=filei0 or filei, **kwargs) for filei, file in
+            enumerate(globs_image_audio_types)
         )
     else:
-        image_documents = [path_to_doc1(file, filei=filei, **kwargs) for filei, file in
-                           enumerate(tqdm(globs_image_types))]
+        image_documents = [path_to_doc1(file, filei=filei0 or filei, **kwargs) for filei, file in
+                           enumerate(my_tqdm(globs_image_audio_types))]
 
     # unload loaders (image loaders, includes enable_pdf_doctr that uses same loader)
     for name, loader in model_loaders.items():
@@ -2919,7 +4598,8 @@ def prep_langchain(persist_directory,
                    hf_embedding_model,
                    migrate_embedding_model,
                    auto_migrate_db,
-                   n_jobs=-1, kwargs_make_db={},
+                   n_jobs=-1, embedding_gpu_id=0,
+                   kwargs_make_db={},
                    verbose=False):
     """
     do prep first time, involving downloads
@@ -2943,7 +4623,7 @@ def prep_langchain(persist_directory,
                             db_type, use_openai_embedding,
                             langchain_mode, langchain_mode_paths, langchain_mode_types,
                             hf_embedding_model, migrate_embedding_model, auto_migrate_db,
-                            n_jobs=n_jobs)
+                            n_jobs=n_jobs, embedding_gpu_id=embedding_gpu_id)
     else:
         if db_dir_exists and user_path is not None:
             if verbose:
@@ -2961,7 +4641,7 @@ def prep_langchain(persist_directory,
             get_wiki_sources(first_para=kwargs_make_db['first_para'], text_limit=kwargs_make_db['text_limit'])
 
         langchain_kwargs = kwargs_make_db.copy()
-        langchain_kwargs.update(locals())
+        langchain_kwargs.update(locals().copy())
         db, num_new_sources, new_sources_metadata = make_db(**langchain_kwargs)
 
     return db
@@ -3007,9 +4687,10 @@ def check_update_chroma_embedding(db,
                                   use_openai_embedding,
                                   hf_embedding_model, migrate_embedding_model, auto_migrate_db,
                                   langchain_mode, langchain_mode_paths, langchain_mode_types,
-                                  n_jobs=-1):
+                                  n_jobs=-1,
+                                  verbose=False):
     changed_db = False
-    embed_tuple = load_embed(db=db)
+    embed_tuple = load_embed(db=db, use_openai_embedding=use_openai_embedding)
 
     # expect string comparison, if dict then model object with name and get name not dict or model
     hf_embedding_model = get_hf_embedding_model_name(hf_embedding_model)
@@ -3037,6 +4718,7 @@ def check_update_chroma_embedding(db,
                     migrate_embedding_model=migrate_embedding_model,
                     auto_migrate_db=auto_migrate_db,
                     n_jobs=n_jobs,
+                    verbose=verbose,
                     )
         changed_db = True
         print("Done updating db for new embedding: %s" % langchain_mode, flush=True)
@@ -3087,7 +4769,8 @@ def get_existing_db(db, persist_directory,
                     migrate_embedding_model,
                     auto_migrate_db=False,
                     verbose=False, check_embedding=True, migrate_meta=True,
-                    n_jobs=-1):
+                    n_jobs=-1,
+                    embedding_gpu_id=0):
     if load_db_if_exists and db_type in ['chroma', 'chroma_old'] and os.path.isdir(persist_directory):
         if os.path.isfile(os.path.join(persist_directory, 'chroma.sqlite3')):
             must_migrate = False
@@ -3118,37 +4801,61 @@ def get_existing_db(db, persist_directory,
         if db is None:
             if verbose:
                 print("DO Loading db: %s" % langchain_mode, flush=True)
-            got_embedding, use_openai_embedding0, hf_embedding_model0 = load_embed(persist_directory=persist_directory)
-            if got_embedding:
-                use_openai_embedding, hf_embedding_model = use_openai_embedding0, hf_embedding_model0
-            embedding = get_embedding(use_openai_embedding, hf_embedding_model=hf_embedding_model)
+            got_embedding, use_openai_embedding0, hf_embedding_model0 = load_embed(persist_directory=persist_directory,
+                                                                                   use_openai_embedding=use_openai_embedding)
+            if got_embedding and hf_embedding_model and 'name' in hf_embedding_model and hf_embedding_model0 == \
+                    hf_embedding_model['name']:
+                # already have
+                embedding = hf_embedding_model['model']
+            else:
+                if got_embedding:
+                    # doesn't match, must load new
+                    use_openai_embedding, hf_embedding_model = use_openai_embedding0, hf_embedding_model0
+                else:
+                    if hf_embedding_model and 'name' in hf_embedding_model:
+                        # if no embedding, use same as preloaded
+                        hf_embedding_model = hf_embedding_model['name']
+                embedding = get_embedding(use_openai_embedding, hf_embedding_model=hf_embedding_model,
+                                          gpu_id=embedding_gpu_id)
             import logging
             logging.getLogger("chromadb").setLevel(logging.ERROR)
             if use_chromamigdb:
                 from chromamigdb.config import Settings
                 chroma_class = ChromaMig
+                api_kwargs = {}
             else:
                 from chromadb.config import Settings
                 chroma_class = Chroma
-            client_settings = Settings(anonymized_telemetry=False,
-                                       **chroma_settings,
-                                       persist_directory=persist_directory)
+                if os.path.isdir(persist_directory):
+                    import chromadb
+                    api_kwargs = dict(client=chromadb.PersistentClient(path=persist_directory))
+                else:
+                    api_kwargs = {}
+            if not api_kwargs:
+                client_settings = Settings(anonymized_telemetry=False,
+                                           **chroma_settings,
+                                           persist_directory=persist_directory)
+                api_kwargs = dict(client_settings=client_settings)
             db = chroma_class(persist_directory=persist_directory, embedding_function=embedding,
                               collection_name=langchain_mode.replace(' ', '_'),
-                              client_settings=client_settings)
+                              **api_kwargs)
             try:
-                db.similarity_search('')
+                with get_context_cast():
+                    db.similarity_search('')
             except BaseException as e:
                 # migration when no embed_info
                 if 'Dimensionality of (768) does not match index dimensionality (384)' in str(e) or \
-                        'Embedding dimension 768 does not match collection dimensionality 384' in str(e):
+                        'Embedding dimension 768 does not match collection dimensionality 384' in str(e) or \
+                        'Embedding dimension 768 does not match collection dimensionality 1536' in str(e) or \
+                        'Dimensionality of (1536) does not match index dimensionality (384)' in str(e):
                     hf_embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
                     embedding = get_embedding(use_openai_embedding, hf_embedding_model=hf_embedding_model)
                     db = chroma_class(persist_directory=persist_directory, embedding_function=embedding,
                                       collection_name=langchain_mode.replace(' ', '_'),
-                                      client_settings=client_settings)
+                                      **api_kwargs)
                     # should work now, let fail if not
-                    db.similarity_search('')
+                    with get_context_cast():
+                        db.similarity_search('')
                     save_embed(db, use_openai_embedding, hf_embedding_model)
                 else:
                     raise
@@ -3158,7 +4865,8 @@ def get_existing_db(db, persist_directory,
         else:
             if not migrate_embedding_model:
                 # OVERRIDE embedding choices if could load embedding info when not migrating
-                got_embedding, use_openai_embedding, hf_embedding_model = load_embed(db=db)
+                got_embedding, use_openai_embedding, hf_embedding_model = load_embed(db=db,
+                                                                                     use_openai_embedding=use_openai_embedding)
             if verbose:
                 print("USING already-loaded db: %s" % langchain_mode, flush=True)
         if check_embedding:
@@ -3171,7 +4879,8 @@ def get_existing_db(db, persist_directory,
                                                                  langchain_mode,
                                                                  langchain_mode_paths,
                                                                  langchain_mode_types,
-                                                                 n_jobs=n_jobs)
+                                                                 n_jobs=n_jobs,
+                                                                 verbose=verbose)
             if changed_db:
                 db = db_trial
                 # only call persist if really changed db, else takes too long for large db
@@ -3254,7 +4963,7 @@ def save_embed(db, use_openai_embedding, hf_embedding_model):
     return use_openai_embedding, hf_embedding_model
 
 
-def load_embed(db=None, persist_directory=None):
+def load_embed(db=None, persist_directory=None, use_openai_embedding=False):
     if hasattr(db, 'embeddings') and hasattr(db.embeddings, 'model_name'):
         hf_embedding_model = db.embeddings.model_name if 'openai' not in db.embeddings.model_name.lower() else None
         use_openai_embedding = hf_embedding_model is None
@@ -3282,11 +4991,20 @@ def load_embed(db=None, persist_directory=None):
                         # unexpected in testing or normally
                         raise
     else:
-        # migration, assume defaults
-        use_openai_embedding, hf_embedding_model = False, "sentence-transformers/all-MiniLM-L6-v2"
-        got_embedding = False
+        # migration or not set yet, assume defaults
+        if use_openai_embedding:
+            use_openai_embedding, hf_embedding_model = True, ''
+            got_embedding = False
+        else:
+            use_openai_embedding, hf_embedding_model = False, "sentence-transformers/all-MiniLM-L6-v2"
+            got_embedding = False
     assert isinstance(hf_embedding_model, str)
     return got_embedding, use_openai_embedding, hf_embedding_model
+
+
+def sanitize_path_segment(segment):
+    # Replace invalid Windows filename characters with an underscore
+    return re.sub(r'[<>:"/\\|?*]', '_', segment)
 
 
 def get_persist_directory(langchain_mode, langchain_type=None, db1s=None, dbs=None):
@@ -3317,13 +5035,31 @@ def get_persist_directory(langchain_mode, langchain_type=None, db1s=None, dbs=No
 
     # deal with existing locations
     user_base_dir = os.getenv('USERS_BASE_DIR', 'users')
+    makedirs(user_base_dir)
+    user_base_dir = sanitize_path_segment(user_base_dir)
+    dirid = sanitize_path_segment(dirid)
     persist_directory = os.path.join(user_base_dir, dirid, 'db_dir_%s' % langchain_mode)
     if userid and \
             (os.path.isdir(persist_directory) or
              db1s is not None and langchain_mode in db1s or
              langchain_type == LangChainTypes.PERSONAL.value):
         langchain_type = LangChainTypes.PERSONAL.value
-        persist_directory = makedirs(persist_directory, use_base=True)
+        if userid:
+            # then maybe logged in after added docs as non-logged-in user, try to preserve
+            persist_directory0 = os.path.join(user_base_dir, userid, 'db_dir_%s' % langchain_mode)
+            if userid != dirid and os.path.isdir(persist_directory0):
+                # link new directory instead of making new directory
+                try:
+                    persist_directory1 = os.path.join(user_base_dir, dirid, 'db_dir_%s' % langchain_mode)
+                    create_relative_symlink(persist_directory0, persist_directory1)
+                except Exception as e:
+                    print("Failed to soft link: %s %s :%s" % (userid, dirid, str(e)), flush=True)
+                    persist_directory = makedirs(persist_directory, use_base=True)
+                assert os.path.isdir(persist_directory)
+            else:
+                persist_directory = makedirs(persist_directory, use_base=True)
+        else:
+            persist_directory = makedirs(persist_directory, use_base=True)
         check_persist_directory(persist_directory)
         return persist_directory, langchain_type
 
@@ -3365,6 +5101,8 @@ def _make_db(use_openai_embedding=False,
              use_unstructured=True,
              use_playwright=False,
              use_selenium=False,
+             use_scrapeplaywright=False,
+             use_scrapehttp=False,
 
              # pdfs
              use_pymupdf='auto',
@@ -3379,13 +5117,21 @@ def _make_db(use_openai_embedding=False,
              enable_doctr=False,
              enable_pix2struct=False,
              enable_captions=True,
+             enable_llava=True,
+             enable_transcriptions=True,
              captions_model=None,
              caption_loader=None,
+             llava_model=None,
+             llava_prompt=None,
              doctr_loader=None,
              pix2struct_loader=None,
+             asr_model=None,
+             asr_loader=None,
 
              # json
              jq_schema='.[]',
+             # video
+             extract_frames=10,
 
              langchain_mode=None,
              langchain_mode_paths=None,
@@ -3458,6 +5204,8 @@ def _make_db(use_openai_embedding=False,
                                 use_unstructured=use_unstructured,
                                 use_playwright=use_playwright,
                                 use_selenium=use_selenium,
+                                use_scrapeplaywright=use_scrapeplaywright,
+                                use_scrapehttp=use_scrapehttp,
 
                                 # pdfs
                                 use_pymupdf=use_pymupdf,
@@ -3472,16 +5220,27 @@ def _make_db(use_openai_embedding=False,
                                 enable_doctr=enable_doctr,
                                 enable_pix2struct=enable_pix2struct,
                                 enable_captions=enable_captions,
+                                enable_llava=enable_llava,
+                                enable_transcriptions=enable_transcriptions,
                                 captions_model=captions_model,
                                 caption_loader=caption_loader,
+                                llava_model=llava_model,
+                                llava_prompt=llava_prompt,
                                 doctr_loader=doctr_loader,
                                 pix2struct_loader=pix2struct_loader,
+                                asr_model=asr_model,
+                                asr_loader=asr_loader,
 
                                 # json
                                 jq_schema=jq_schema,
+                                extract_frames=extract_frames,
 
                                 existing_files=existing_files, existing_hash_ids=existing_hash_ids,
-                                db_type=db_type)
+                                db_type=db_type,
+
+                                is_public=False,
+                                from_ui=True,
+                                )
         new_metadata_sources = set([x.metadata['source'] for x in sources1])
         if new_metadata_sources:
             if os.getenv('NO_NEW_FILES') is not None:
@@ -3495,7 +5254,8 @@ def _make_db(use_openai_embedding=False,
             raise RuntimeError("Expected no new files! %s" % langchain_mode)
         if len(sources) == 0 and os.getenv('SHOULD_NEW_FILES') is not None:
             raise RuntimeError("Expected new files! %s" % langchain_mode)
-        print("Loaded %s sources for potentially adding to %s" % (len(sources), langchain_mode), flush=True)
+        if verbose:
+            print("Loaded %s sources for potentially adding to %s" % (len(sources), langchain_mode), flush=True)
 
         # see if got sources
         if not sources:
@@ -3520,7 +5280,8 @@ def _make_db(use_openai_embedding=False,
                         hf_embedding_model=hf_embedding_model,
                         migrate_embedding_model=migrate_embedding_model,
                         auto_migrate_db=auto_migrate_db,
-                        n_jobs=n_jobs)
+                        n_jobs=n_jobs,
+                        verbose=verbose)
             if verbose:
                 print("Generated db", flush=True)
         elif langchain_mode not in langchain_modes_intrinsic:
@@ -3530,7 +5291,8 @@ def _make_db(use_openai_embedding=False,
         print("Existing db, potentially adding %s sources from user_path=%s" % (len(sources), user_path), flush=True)
         db, num_new_sources, new_sources_metadata = add_to_db(db, sources, db_type=db_type,
                                                               use_openai_embedding=use_openai_embedding,
-                                                              hf_embedding_model=hf_embedding_model)
+                                                              hf_embedding_model=hf_embedding_model,
+                                                              verbose=verbose)
         print("Existing db, added %s new sources from user_path=%s" % (num_new_sources, user_path), flush=True)
     else:
         new_sources_metadata = [x.metadata for x in sources]
@@ -3552,7 +5314,9 @@ def is_new_chroma_db(db):
     return False
 
 
-def sim_search(db, query='', k=1000, with_score=False, filter_kwargs=None, chunk_id_filter=None, verbose=False):
+def sim_search(db, query='', k=1000, with_score=False, filter_kwargs=None, chunk_id_filter=None,
+               where_document_dict={},
+               verbose=False):
     if is_chroma_db(db) and large_chroma_db(db) and chunk_id_filter is not None:
         # try to avoid filter if just doing chunk_id -1 or >= 0
         docs = _sim_search(db, query=query, k=k * 4, with_score=with_score, verbose=verbose)
@@ -3569,13 +5333,18 @@ def sim_search(db, query='', k=1000, with_score=False, filter_kwargs=None, chunk
         if len(docs) < max(1, k // 4):
             # full search if failed to find enough
             docs = _sim_search(db, query=query, k=k, with_score=with_score, filter_kwargs=filter_kwargs,
+                               where_document_dict=where_document_dict,
                                verbose=verbose)
         return docs
     else:
-        return _sim_search(db, query=query, k=k, with_score=with_score, filter_kwargs=filter_kwargs, verbose=verbose)
+        return _sim_search(db, query=query, k=k, with_score=with_score, filter_kwargs=filter_kwargs,
+                           where_document_dict=where_document_dict,
+                           verbose=verbose)
 
 
-def _sim_search(db, query='', k=1000, with_score=False, filter_kwargs=None, verbose=False):
+def _sim_search(db, query='', k=1000, with_score=False, filter_kwargs=None,
+                where_document_dict={},
+                verbose=False):
     if k == -1:
         k = 1000
     if filter_kwargs is None:
@@ -3584,9 +5353,11 @@ def _sim_search(db, query='', k=1000, with_score=False, filter_kwargs=None, verb
     while True:
         try:
             if with_score:
-                docs = db.similarity_search_with_score(query, k=k, **filter_kwargs)
+                with get_context_cast():
+                    docs = db.similarity_search_with_score(query, k=k, **filter_kwargs, **where_document_dict)
             else:
-                docs = db.similarity_search(query, k=k, **filter_kwargs)
+                with get_context_cast():
+                    docs = db.similarity_search(query, k=k, **filter_kwargs, **where_document_dict)
             break
         except (RuntimeError, AttributeError) as e:
             # AttributeError is for people with wrong version of langchain
@@ -3611,7 +5382,8 @@ def large_chroma_db(db):
 
 
 def get_metadatas(db, full_required=True, k_max=10000):
-    from langchain.vectorstores import FAISS
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.vectorstores import Qdrant
     if isinstance(db, FAISS):
         metadatas = [v.metadata for k, v in db.docstore._dict.items()]
     elif is_chroma_db(db):
@@ -3630,10 +5402,14 @@ def get_metadatas(db, full_required=True, k_max=10000):
             # just use sim search, since too many
             docs1 = sim_search(db, k=k_max, with_score=False)
             metadatas = [x.metadata for x in docs1]
+    elif isinstance(db, Qdrant):
+        points, _ = db.client.scroll(db.collection_name, limit=k_max, with_payload=True)
+        metadatas = [point.payload["metadata"] for point in points]
     elif db is not None:
         # FIXME: Hack due to https://github.com/weaviate/weaviate/issues/1947
         # seems no way to get all metadata, so need to avoid this approach for weaviate
-        metadatas = [x.metadata for x in db.similarity_search("", k=k_max)]
+        with get_context_cast():
+            metadatas = [x.metadata for x in db.similarity_search("", k=k_max)]
     else:
         metadatas = []
     return metadatas
@@ -3664,7 +5440,8 @@ def get_documents(db):
 def _get_documents(db):
     # returns not just documents, but full dict of documents, metadatas, ids, embeddings
     # documents['documents] should be list of texts, not Document() type
-    from langchain.vectorstores import FAISS
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.vectorstores import Qdrant
     if isinstance(db, FAISS):
         documents = [v for k, v in db.docstore._dict.items()]
         documents = dict(documents=documents, metadatas=[{}] * len(documents), ids=[0] * len(documents))
@@ -3672,10 +5449,18 @@ def _get_documents(db):
         documents = db.get()
         if documents is None:
             documents = dict(documents=[], metadatas=[], ids=[])
+    elif isinstance(db, Qdrant):
+        points, next_id = db.client.scroll(db.collection_name, limit=10000, with_payload=True)
+        documents, metadatas = [], []
+        for point in points:
+            documents.append(point.payload["page_content"])
+            metadatas.append(point.payload["metadata"])
+        documents = dict(documents=documents, metadatas=metadatas, ids=[0] * len(documents))
     else:
         # FIXME: Hack due to https://github.com/weaviate/weaviate/issues/1947
         # seems no way to get all metadata, so need to avoid this approach for weaviate
-        docs_from_search = [x for x in db.similarity_search("", k=10000)]
+        with get_context_cast():
+            docs_from_search = [x for x in db.similarity_search("", k=10000)]
         # Don't filter out by content etc. here, might use get_metadatas too separately
         documents = [x.page_content for x in docs_from_search]
         metadatas = [x.metadata for x in docs_from_search]
@@ -3707,7 +5492,7 @@ def _get_docs_and_meta(db, top_k_docs, filter_kwargs={}, text_context_list=None,
         db_documents += [x.page_content if hasattr(x, 'page_content') else x for x in text_context_list]
         db_metadatas += [x.metadata if hasattr(x, 'metadata') else {} for x in text_context_list]
 
-    from langchain.vectorstores import FAISS
+    from langchain_community.vectorstores import FAISS
     if isinstance(db, Chroma) or isinstance(db, ChromaMig) or ChromaMig.__name__ in str(db):
         if top_k_docs == -1:
             limit = k_max
@@ -3754,6 +5539,7 @@ def run_qa_db(**kwargs):
     kwargs['answer_with_sources'] = kwargs.get('answer_with_sources', True)
     kwargs['show_rank'] = kwargs.get('show_rank', False)
     kwargs['show_accordions'] = kwargs.get('show_accordions', True)
+    kwargs['hyde_show_intermediate_in_accordion'] = kwargs.get('hyde_show_intermediate_in_accordion', True)
     kwargs['show_link_in_sources'] = kwargs.get('show_link_in_sources', True)
     kwargs['top_k_docs_max_show'] = kwargs.get('top_k_docs_max_show', 10)
     kwargs['llamacpp_dict'] = {}  # shouldn't be required unless from test using _run_qa_db
@@ -3761,6 +5547,19 @@ def run_qa_db(**kwargs):
     kwargs['gptq_dict'] = {}  # shouldn't be required unless from test using _run_qa_db
     kwargs['sink_dict'] = {}  # shouldn't be required unless from test using _run_qa_db
     kwargs['hf_model_dict'] = {}  # shouldn't be required unless from test using _run_qa_db
+    kwargs['force_seq2seq_type'] = False  # shouldn't be required unless from test using _run_qa_db
+    kwargs['force_t5_type'] = False  # shouldn't be required unless from test using _run_qa_db
+    kwargs['image_file'] = kwargs.get('image_file')
+    kwargs['image_control'] = kwargs.get('image_control')
+    kwargs['load_awq'] = kwargs.get('load_awq', '')
+
+    kwargs['response_format'] = kwargs.get('response_format', 'text')
+    kwargs['guided_json'] = kwargs.get('guided_json', '')
+    kwargs['guided_regex'] = kwargs.get('guided_regex', '')
+    kwargs['guided_choice'] = kwargs.get('guided_choice', '')
+    kwargs['guided_grammar'] = kwargs.get('guided_grammar', '')
+    kwargs['json_vllm'] = kwargs.get('json_vllm', False)
+
     missing_kwargs = [x for x in func_names if x not in kwargs]
     assert not missing_kwargs, "Missing kwargs for run_qa_db: %s" % missing_kwargs
     # only keep actual used
@@ -3768,7 +5567,8 @@ def run_qa_db(**kwargs):
     try:
         return _run_qa_db(**kwargs)
     finally:
-        clear_torch_cache()
+        if kwargs.get('cli', False):
+            clear_torch_cache(allow_skip=True)
 
 
 def _run_qa_db(query=None,
@@ -3776,11 +5576,14 @@ def _run_qa_db(query=None,
                context=None,
                use_openai_model=False, use_openai_embedding=False,
                first_para=False, text_limit=None, top_k_docs=4, chunk=True, chunk_size=512,
+               langchain_instruct_mode=True,
 
                # urls
                use_unstructured=True,
                use_playwright=False,
                use_selenium=False,
+               use_scrapeplaywright=False,
+               use_scrapehttp=False,
 
                # pdfs
                use_pymupdf='auto',
@@ -3795,13 +5598,20 @@ def _run_qa_db(query=None,
                enable_doctr=False,
                enable_pix2struct=False,
                enable_captions=True,
+               enable_llava=True,
+               enable_transcriptions=True,
                captions_model=None,
                caption_loader=None,
+               llava_model=None,
+               llava_prompt=None,
                doctr_loader=None,
                pix2struct_loader=None,
+               asr_model=None,
+               asr_loader=None,
 
                # json
                jq_schema='.[]',
+               extract_frames=10,
 
                langchain_mode_paths={},
                langchain_mode_types={},
@@ -3809,6 +5619,7 @@ def _run_qa_db(query=None,
                db_type=None,
                model_name=None, model=None, tokenizer=None, inference_server=None,
                langchain_only_model=False,
+               load_awq='',
                hf_embedding_model=None,
                migrate_embedding_model=False,
                auto_migrate_db=False,
@@ -3820,22 +5631,27 @@ def _run_qa_db(query=None,
                prompt_type=None,
                prompt_dict=None,
                answer_with_sources=True,
-               append_sources_to_answer=True,
+               append_sources_to_answer=False,
+               append_sources_to_chat=True,
                cut_distance=1.64,
                add_chat_history_to_context=True,
                add_search_to_context=False,
                keep_sources_in_context=False,
+               gradio_errors_to_chatbot=True,
                memory_restriction_level=0,
                system_prompt='',
+               allow_chat_system_prompt=True,
                sanitize_bot_response=False,
                show_rank=False,
                show_accordions=True,
+               hyde_show_intermediate_in_accordion=True,
                show_link_in_sources=True,
                top_k_docs_max_show=10,
                use_llm_if_no_docs=True,
                load_db_if_exists=False,
                db=None,
                do_sample=False,
+               seed=0,
                temperature=0.1,
                top_p=0.7,
                top_k=40,
@@ -3844,8 +5660,11 @@ def _run_qa_db(query=None,
                max_new_tokens=512,
                min_new_tokens=1,
                attention_sinks=False,
+               sink_dict={},
                truncation_generation=False,
                early_stopping=False,
+               regenerate_clients=None,
+               regenerate_gradio_clients=None,
                max_time=180,
                repetition_penalty=1.0,
                num_return_sequences=1,
@@ -3854,32 +5673,53 @@ def _run_qa_db(query=None,
                langchain_agents=None,
                document_subset=DocumentSubset.Relevant.name,
                document_choice=[DocumentChoice.ALL.value],
+               document_source_substrings=[],
+               document_source_substrings_op='and',
+               document_content_substrings=[],
+               document_content_substrings_op='and',
                pre_prompt_query=None,
                prompt_query=None,
                pre_prompt_summary=None,
                prompt_summary=None,
+               hyde_llm_prompt=None,
                text_context_list=None,
                chat_conversation=None,
                visible_models=None,
                h2ogpt_key=None,
                docs_ordering_type=docs_ordering_types_default,
-               min_max_new_tokens=256,
+               min_max_new_tokens=512,
                max_input_tokens=-1,
+               max_total_input_tokens=-1,
                docs_token_handling=None,
-               docs_joiner=None,
-               hyde_level=None,
+               docs_joiner=docs_joiner_default,
+               hyde_level=0,
                hyde_template=None,
+               hyde_show_only_final=None,
+               doc_json_mode=False,
+               metadata_in_context=[],
 
                n_jobs=-1,
+               llamacpp_path=None,
                llamacpp_dict=None,
                exllama_dict=None,
                verbose=False,
                cli=False,
                lora_weights='',
+
                auto_reduce_chunks=True,
                max_chunks=100,
-               total_tokens_for_docs=None,
                headsize=50,
+
+               image_file=None,
+               image_control=None,
+
+               response_format=None,
+               guided_json=None,
+               guided_regex=None,
+               guided_choice=None,
+               guided_grammar=None,
+
+               json_vllm=False,
                ):
     """
 
@@ -3896,6 +5736,7 @@ def _run_qa_db(query=None,
                     'chroma' (for chroma >= 0.4)
                     'chroma_old' (for chroma < 0.4)
                     'weaviate' for persisted on disk
+                    'qdrant' for a Qdrant server or an in-memory instance
     :param model_name: model name, used to switch behaviors
     :param model: pre-initialized model, else will make new one
     :param tokenizer: pre-initialized tokenizer, else will make new one.  Required not None if model is not None
@@ -3910,6 +5751,8 @@ def _run_qa_db(query=None,
     elif langchain_action in [LangChainAction.QUERY.value]:
         # only summarization supported
         async_output = False
+    elif LangChainAgent.AUTOGPT.value in langchain_agents:
+        async_output = False
     else:
         if stream_output0:
             # threads and asyncio don't mix
@@ -3918,15 +5761,22 @@ def _run_qa_db(query=None,
             # go back to not streaming for summarization/extraction to be parallel
             stream_output = stream_output0
 
+    # avoid source stuff in response if not textual, e.g. json
+    if response_format != 'text':
+        answer_with_sources = False
+        append_sources_to_answer = False
+        hyde_show_intermediate_in_accordion = False
+
     # in case doing summarization/extraction, and docs originally limit, relax if each document or reduced response is smaller than max document size
     max_new_tokens0 = max_new_tokens
 
     # in case None, e.g. lazy client, then set based upon actual model
-    pre_prompt_query, prompt_query, pre_prompt_summary, prompt_summary = \
+    pre_prompt_query, prompt_query, pre_prompt_summary, prompt_summary, hyde_llm_prompt = \
         get_langchain_prompts(pre_prompt_query, prompt_query,
-                              pre_prompt_summary, prompt_summary,
+                              pre_prompt_summary, prompt_summary, hyde_llm_prompt,
                               model_name, inference_server,
-                              llamacpp_dict.get('model_path_llama'))
+                              llamacpp_dict.get('model_path_llama'),
+                              doc_json_mode)
 
     assert db_type is not None
     assert hf_embedding_model is not None
@@ -3946,18 +5796,59 @@ def _run_qa_db(query=None,
         else:
             prompt_dict = ''
 
-    if LangChainAgent.SEARCH.value in langchain_agents and 'llama' in model_name.lower():
+    query_action = langchain_action == LangChainAction.QUERY.value
+    summarize_action = langchain_action in [LangChainAction.SUMMARIZE_MAP.value,
+                                            LangChainAction.SUMMARIZE_ALL.value,
+                                            LangChainAction.SUMMARIZE_REFINE.value,
+                                            LangChainAction.EXTRACT.value]
+
+    zero_shot_react_agent = any([x in langchain_agents for x in
+                                 [LangChainAgent.SEARCH.value,
+                                  LangChainAgent.CSV.value,
+                                  LangChainAgent.PANDAS.value,
+                                  ]]) and \
+                            not does_support_functiontools(inference_server, model_name)
+    if zero_shot_react_agent:
+        if LangChainAgent.SEARCH.value in langchain_agents:
+            answer_type = " bullet list"
+        else:
+            answer_type = ""
         system_prompt = """You are a zero shot react agent.
-Consider to prompt of Question that was original query from the user.
+Consider to prompt of Question that was original query from the user.  Do not repeat "Question" as a prompt, that is only for the user.
 Respond to prompt of Thought with a thought that may lead to a reasonable new action choice.
 Respond to prompt of Action with an action to take out of the tools given, giving exactly single word for the tool name.
 Respond to prompt of Action Input with an input to give the tool.
 Consider to prompt of Observation that was response from the tool.
 Repeat this Thought, Action, Action Input, Observation, Thought sequence several times with new and different thoughts and actions each time, do not repeat.
 Once satisfied that the thoughts, responses are sufficient to answer the question, then respond to prompt of Thought with: I now know the final answer
-Respond to prompt of Final Answer with your final high-quality bullet list answer to the original query.
-"""
+Respond to prompt of Final Answer with your final well-structured%s answer to the original query.
+""" % answer_type
         prompter.system_prompt = system_prompt
+
+    if doc_json_mode:
+        prompter.system_prompt = system_prompt = doc_json_mode_system_prompt
+
+    doing_grounding = tokenizer is not None and \
+                      hasattr(tokenizer, 'apply_grounded_generation_template') and \
+                      prompt_type not in [noop_prompt_type, template_prompt_type]
+
+    # handle auto case
+    if system_prompt == 'auto':
+        changed = False
+        if query_action and langchain_mode not in langchain_modes_non_db:
+            system_prompt = system_docqa
+            changed = True
+        elif summarize_action:
+            system_prompt = system_summary
+            changed = True
+        if changed and prompter:
+            prompter.system_prompt = system_prompt
+        if system_prompt == 'auto':
+            if prompter:
+                system_prompt = prompter.system_prompt
+            if system_prompt == 'auto':
+                # safest then to just avoid system prompt
+                system_prompt = prompter.system_prompt = ""
 
     assert len(set(gen_hyper).difference(inspect.signature(get_llm).parameters)) == 0
     # pass in context to LLM directly, since already has prompt_type structure
@@ -3967,10 +5858,12 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
                       tokenizer=tokenizer,
                       inference_server=inference_server,
                       langchain_only_model=langchain_only_model,
+                      load_awq=load_awq,
                       stream_output=stream_output,
                       async_output=async_output,
                       num_async=num_async,
                       do_sample=do_sample,
+                      seed=seed,
                       temperature=temperature,
                       top_k=top_k,
                       top_p=top_p,
@@ -3981,6 +5874,8 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
                       min_new_tokens=min_new_tokens,
                       early_stopping=early_stopping,
                       max_time=max_time,
+                      regenerate_clients=regenerate_clients,
+                      regenerate_gradio_clients=regenerate_gradio_clients,
                       repetition_penalty=repetition_penalty,
                       num_return_sequences=num_return_sequences,
                       prompt_type=prompt_type,
@@ -3990,24 +5885,43 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
                       iinput=iinput,
                       sanitize_bot_response=sanitize_bot_response,
                       system_prompt=system_prompt,
+                      chat_conversation=chat_conversation,
+                      add_chat_history_to_context=add_chat_history_to_context,
                       visible_models=visible_models,
                       h2ogpt_key=h2ogpt_key,
                       min_max_new_tokens=min_max_new_tokens,
                       max_input_tokens=max_input_tokens,
+                      max_total_input_tokens=max_total_input_tokens,
                       n_jobs=n_jobs,
+                      llamacpp_path=llamacpp_path,
                       llamacpp_dict=llamacpp_dict,
                       exllama_dict=exllama_dict,
                       cli=cli,
                       verbose=verbose,
                       attention_sinks=attention_sinks,
+                      sink_dict=sink_dict,
                       truncation_generation=truncation_generation,
+                      langchain_agents=langchain_agents,
+
+                      image_file=image_file,
+                      image_control=image_control,
+                      document_choice=document_choice,
+
+                      response_format=response_format,
+                      guided_json=guided_json,
+                      guided_regex=guided_regex,
+                      guided_choice=guided_choice,
+                      guided_grammar=guided_grammar,
+
+                      doing_grounding=doing_grounding,
+                      json_vllm=json_vllm,
                       )
     llm, model_name, streamer, prompt_type_out, async_output, only_new_text, gradio_server = \
         get_llm(**llm_kwargs)
     if LangChainAgent.SMART.value in langchain_agents:
         # get llm for exploration
         llm_kwargs_explore = llm_kwargs.copy()
-        llm_kwargs_explore.update(dict(do_sample=True, temperature=0.5))
+        llm_kwargs_explore.update(dict(do_sample=True, temperature=0.5, seed=randint(0, 32000)))
         llm_explore, _, _, _, _, _, _ = get_llm(**llm_kwargs_explore)
     else:
         llm_explore = None
@@ -4023,11 +5937,23 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
             prompt_type = prompt_type_out
         # get prompter
         chat = True  # FIXME?
-        prompter = Prompter(prompt_type, prompt_dict, debug=False, chat=chat, stream_output=stream_output,
-                            system_prompt=system_prompt)
+        prompter = Prompter(prompt_type, prompt_dict, debug=False, stream_output=stream_output,
+                            system_prompt=system_prompt, tokenizer=tokenizer)
 
     scores = []
     chain = None
+
+    if query.startswith(summary_prefix) or query.startswith(extract_prefix):
+        # avoid gradio_runner injection of user lead to query being filled
+        query = ''
+    if inference_server and \
+            inference_server.startswith('anthropic') and \
+            is_json_model(model_name, inference_server) and \
+            guided_json and response_format == 'json_object':
+        extra = '\n\nUse the `JSON` tool.\n'
+        if query_action:
+            query += extra
+        prompt_summary += extra
 
     # basic version of prompt without docs etc.
     data_point = dict(context=context, instruction=query, input=iinput)
@@ -4036,18 +5962,16 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
     # default is to embed query directly without processing
     query_embedding = query
 
+    # support string as well
     if isinstance(document_choice, str):
-        # support string as well
         document_choice = [document_choice]
-
-    # NOTE: Could try to establish if pure llm mode or not, but makes code too complex
-    query_action = langchain_action == LangChainAction.QUERY.value
-    summarize_action = langchain_action in [LangChainAction.SUMMARIZE_MAP.value,
-                                            LangChainAction.SUMMARIZE_ALL.value,
-                                            LangChainAction.SUMMARIZE_REFINE.value,
-                                            LangChainAction.EXTRACT.value]
+    if isinstance(document_source_substrings, str):
+        document_source_substrings = [document_source_substrings]
+    if isinstance(document_content_substrings, str):
+        document_content_substrings = [document_content_substrings]
 
     get_answer_kwargs = dict(show_accordions=show_accordions,
+                             hyde_show_intermediate_in_accordion=hyde_show_intermediate_in_accordion,
                              show_link_in_sources=show_link_in_sources,
                              top_k_docs_max_show=top_k_docs_max_show,
                              verbose=verbose,
@@ -4060,14 +5984,21 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
                                         sanitize_bot_response=sanitize_bot_response,
                                         verbose=verbose)
 
+    run_target_func_hyde = functools.partial(run_target,
+                                             stream_output=stream_output,
+                                             lora_weights=lora_weights, max_time=max_time,
+                                             sanitize_bot_response=sanitize_bot_response,
+                                             allow_response_no_refs=False,
+                                             verbose=verbose)
+
     func_names = list(inspect.signature(get_chain).parameters)
     sim_kwargs = {k: v for k, v in locals().items() if k in func_names}
     missing_kwargs = [x for x in func_names if x not in sim_kwargs]
     assert not missing_kwargs, "Missing: %s" % missing_kwargs
 
-    llm_answers = {}
+    llm_answers = dict(response_raw='')
     if hyde_level is not None and hyde_level > 0 and query_action and document_subset not in non_query_commands:
-        query_embedding, llm_answers = yield from run_hyde(**locals())
+        query_embedding, llm_answers = yield from run_hyde(**locals().copy())
         sim_kwargs['query_embedding'] = query_embedding
 
     docs, chain, scores, \
@@ -4080,41 +6011,54 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
         formatted_doc_chunks = '\n\n'.join([get_url(x) + '\n\n' + x.page_content for x in docs])
         if not formatted_doc_chunks and not use_llm_if_no_docs:
             yield dict(prompt=prompt_basic, response="No sources", sources='', num_prompt_tokens=0,
-                       llm_answers=llm_answers)
+                       llm_answers=llm_answers, response_no_refs='', sources_str='', prompt_raw=prompt_basic)
             return
         # if no sources, outside gpt_langchain, LLM will be used with '' input
         scores = [1] * len(docs)
-        get_answer_args = tuple([query, docs, formatted_doc_chunks, scores, show_rank,
+        get_answer_args = tuple([query, docs, formatted_doc_chunks,
+                                 llm_answers,
+                                 scores, show_rank,
                                  answer_with_sources,
-                                 append_sources_to_answer])
+                                 append_sources_to_answer,
+                                 append_sources_to_chat])
         get_answer_kwargs.update(dict(t_run=time.time() - t_run,
                                       count_input_tokens=0,
                                       count_output_tokens=0,
                                       ))
-        ret, extra = get_sources_answer(*get_answer_args, **get_answer_kwargs)
-        yield dict(prompt=prompt_basic, response=formatted_doc_chunks, sources=extra, num_prompt_tokens=0,
-                   llm_answers=llm_answers)
+        ret, sources, ret_no_refs, sources_str = get_sources_answer(*get_answer_args, **get_answer_kwargs)
+        if response_format in ['json_object', 'json_code']:
+            ret = '{"response": "%s"}' % ret
+        yield dict(prompt=prompt_basic, response=formatted_doc_chunks, sources=sources, num_prompt_tokens=0,
+                   llm_answers=llm_answers, response_no_refs='', sources_str=sources_str, prompt_raw=prompt_basic)
         return
     if langchain_agents and not chain:
         ret = '%s not supported by this model' % langchain_agents[0]
-        extra = ''
-        yield dict(prompt=prompt_basic, response=ret, sources=extra, num_prompt_tokens=0, llm_answers=llm_answers)
+        if response_format in ['json_object', 'json_code']:
+            ret = '{"response": "%s"}' % ret
+        sources = []
+        yield dict(prompt=prompt_basic, response=ret, sources=sources, num_prompt_tokens=0, llm_answers=llm_answers,
+                   response_no_refs=ret, sources_str='', prompt_raw=prompt_basic)
         return
-    if langchain_mode not in langchain_modes_non_db and not docs:
+    # if only images, then still can do valid summarization
+    if langchain_mode not in langchain_modes_non_db and not (docs or image_file):
         if langchain_action in [LangChainAction.SUMMARIZE_MAP.value,
                                 LangChainAction.SUMMARIZE_ALL.value,
                                 LangChainAction.SUMMARIZE_REFINE.value]:
             ret = 'No relevant documents to summarize.' if query or num_docs_before_cut > 0 else 'No documents to summarize.'
         elif langchain_action in [LangChainAction.EXTRACT.value]:
-            ret = 'No relevant documents to extract from.' if query or num_docs_before_cut > 0 else 'No documents to extract from.'
+            ret = ['No relevant documents to extract from.'] if query or num_docs_before_cut > 0 else [
+                'No documents to extract from.']
         elif not use_llm_if_no_docs:
             ret = 'No relevant documents to query (for chatting with LLM, pick Resources->Collections->LLM).' if num_docs_before_cut else 'No documents to query (for chatting with LLM, pick Resources->Collections->LLM).'
         else:
             # if here then ok to continue using chain if exists.  E.g. use_llm_if_no_docs=True and doing query langchain_action
             ret = None
         if ret is not None:
-            extra = ''
-            yield dict(prompt=prompt_basic, response=ret, sources=extra, num_prompt_tokens=0, llm_answers=llm_answers)
+            if response_format in ['json_object', 'json_code']:
+                ret = '{"response": "%s"}' % ret
+            sources = []
+            yield dict(prompt=prompt_basic, response=ret, sources=sources, num_prompt_tokens=0, llm_answers=llm_answers,
+                       response_no_refs=ret, sources_str='', prompt_raw=prompt_basic)
             return
 
     # NOTE: If chain=None, could return if HF type (i.e. not langchain_only_model), but makes code too complex
@@ -4132,9 +6076,12 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
                                         async_output=async_output,
                                         only_new_text=only_new_text)
 
-    get_answer_args = tuple([query, docs, answer, scores, show_rank,
+    get_answer_args = tuple([query, docs, answer,
+                             llm_answers,
+                             scores, show_rank,
                              answer_with_sources,
-                             append_sources_to_answer])
+                             append_sources_to_answer,
+                             append_sources_to_chat])
     get_answer_kwargs.update(dict(t_run=time.time() - t_run,
                                   count_input_tokens=llm.count_input_tokens
                                   if hasattr(llm, 'count_input_tokens') else None,
@@ -4143,28 +6090,52 @@ Respond to prompt of Final Answer with your final high-quality bullet list answe
                                   ))
 
     # for final yield, get real prompt used
-    if hasattr(llm, 'prompter') and llm.prompter.prompt is not None:
+    if hasattr(llm, 'pipeline') and hasattr(llm.pipeline, 'prompts') and llm.pipeline.prompts:
+        if isinstance(llm.pipeline.prompts, list) and len(llm.pipeline.prompts) == 1:
+            prompt = str(llm.pipeline.prompts[0])
+        else:
+            prompt = str(llm.pipeline.prompts)
+    elif hasattr(llm, 'prompts') and llm.prompts:
+        if isinstance(llm.prompts, list) and len(llm.prompts) == 1:
+            if hasattr(llm.prompts[0], 'text'):
+                prompt = str(llm.prompts[0].text)
+            else:
+                prompt = str(llm.prompts[0])
+        else:
+            prompt = str(llm.prompts)
+    elif hasattr(llm, 'prompter') and llm.prompter.prompt:
         prompt = llm.prompter.prompt
     else:
         prompt = prompt_basic
-    num_prompt_tokens = get_token_count(prompt, tokenizer)
+    if hasattr(llm, 'count_input_tokens') and llm.count_input_tokens != 0:
+        num_prompt_tokens = llm.count_input_tokens
+    else:
+        num_prompt_tokens = get_token_count(prompt, tokenizer)
+
+    # ensure to close client
+    # https://github.com/langchain-ai/langchain/issues/13509
+    if regenerate_clients and \
+            hasattr(llm, 'client') and \
+            hasattr(llm.client, '_client') and \
+            hasattr(llm.client._client, 'close'):
+        llm.client._client.close()
 
     if len(docs) == 0:
         # if no docs, then no sources to cite
-        ret, extra = answer, ''
+        ret, sources = answer, []
         # doesn't actually have docs, but name means got to end with that answer
         llm_answers['llm_answer_final'] = ret
         if verbose:
             print('response: %s' % ret)
-        yield dict(prompt=prompt, response=ret, sources=extra, num_prompt_tokens=num_prompt_tokens,
-                   llm_answers=llm_answers)
+        yield dict(prompt_raw=prompt, response=ret, sources=sources, num_prompt_tokens=num_prompt_tokens,
+                   llm_answers=llm_answers, response_no_refs=ret, sources_str='')
     elif answer is not None:
-        ret, extra = get_sources_answer(*get_answer_args, **get_answer_kwargs)
+        ret, sources, ret_no_refs, sources_str = get_sources_answer(*get_answer_args, **get_answer_kwargs)
         llm_answers['llm_answer_final'] = ret
         if verbose:
             print('response: %s' % ret)
-        yield dict(prompt=prompt, response=ret, sources=extra, num_prompt_tokens=num_prompt_tokens,
-                   llm_answers=llm_answers)
+        yield dict(prompt_raw=prompt, response=ret, sources=sources, num_prompt_tokens=num_prompt_tokens,
+                   llm_answers=llm_answers, response_no_refs=ret_no_refs, sources_str=sources_str)
     return
 
 
@@ -4173,7 +6144,7 @@ def run_target(query='',
                llm=None,
                streamer=None,
                prompter=None,
-               llm_answers={},
+               llm_answers=dict(responses_raw=''),
                llm_answers_key='llm_answer_final',
                async_output=False,
                only_new_text=True,
@@ -4182,6 +6153,7 @@ def run_target(query='',
                lora_weights='',
                max_time=0,
                sanitize_bot_response=False,
+               allow_response_no_refs=True,
                verbose=False):
     # context stuff similar to used in evaluate()
     import torch
@@ -4190,7 +6162,7 @@ def run_target(query='',
                                                                                                'conditional_type') and llm.pipeline.model.conditional_type
     with torch.no_grad():
         have_lora_weights = lora_weights not in [no_lora_str, '', None]
-        context_class_cast = NullContext if device == 'cpu' or have_lora_weights else torch.autocast
+        context_class_cast = NullContext if device == 'cpu' or have_lora_weights or device == 'mps' else torch.autocast
         if conditional_type:
             # issues when casting to float16, can mess up t5 model, e.g. only when not streaming, or other odd behaviors
             context_class_cast = NullContext
@@ -4203,7 +6175,8 @@ def run_target(query='',
                 thread.start()
                 outputs = ""
                 output1_old = ''
-                res_dict = dict(prompt=query, response='', sources='', num_prompt_tokens=0, llm_answers=llm_answers)
+                res_dict = dict(prompt=query, response='', sources='', num_prompt_tokens=0, llm_answers=llm_answers,
+                                response_no_refs='', sources_str='', prompt_raw=query)
                 try:
                     tgen0 = time.time()
                     for new_text in streamer:
@@ -4233,7 +6206,10 @@ def run_target(query='',
                         # in-place change to this key so exposed outside this generator
                         llm_answers[llm_answers_key] = output1
                         res_dict = dict(prompt=query, response=output1, sources='', num_prompt_tokens=0,
-                                        llm_answers=llm_answers)
+                                        llm_answers=llm_answers,
+                                        response_no_refs=output1 if allow_response_no_refs else '',
+                                        sources_str='',
+                                        prompt_raw=query)
                         if output1 != output1_old:
                             yield res_dict
                             output1_old = output1
@@ -4259,6 +6235,14 @@ def run_target(query='',
                                 answer = answer['output']
                             elif 'resolution' in answer:
                                 answer = answer['resolution']
+                        answer_fix = functools.partial(prompter.get_response, prompt=None,
+                                                       only_new_text=only_new_text,
+                                                       sanitize_bot_response=sanitize_bot_response)
+                        if isinstance(answer, str):
+                            # ensure any changes to text are done
+                            answer = answer_fix(answer)
+                        elif isinstance(answer, list):
+                            answer = [answer_fix(x) for x in answer]
                 # in case raise StopIteration or broke queue loop in streamer, but still have exception
                 if thread.exc:
                     raise thread.exc
@@ -4275,6 +6259,14 @@ def run_target(query='',
                             answer = answer['output']
                         elif 'resolution' in answer:
                             answer = answer['resolution']
+                        answer_fix = functools.partial(prompter.get_response, prompt=None,
+                                                       only_new_text=only_new_text,
+                                                       sanitize_bot_response=sanitize_bot_response)
+                        if isinstance(answer, str):
+                            # ensure any changes to text are done
+                            answer = answer_fix(answer)
+                        elif isinstance(answer, list):
+                            answer = [answer_fix(x) for x in answer]
 
     llm_answers[llm_answers_key] = answer
     if verbose:
@@ -4287,12 +6279,14 @@ def get_docs_with_score(query, k_db,
                         filter_kwargs_backup,
                         db, db_type, text_context_list=None,
                         chunk_id_filter=None,
+                        where_document_dict={},
                         verbose=False):
     docs_with_score = _get_docs_with_score(query, k_db,
                                            filter_kwargs,
                                            db, db_type,
                                            text_context_list=text_context_list,
                                            chunk_id_filter=chunk_id_filter,
+                                           where_document_dict=where_document_dict,
                                            verbose=verbose)
     if len(docs_with_score) == 0 and filter_kwargs != filter_kwargs_backup:
         docs_with_score = _get_docs_with_score(query, k_db,
@@ -4300,6 +6294,7 @@ def get_docs_with_score(query, k_db,
                                                db, db_type,
                                                text_context_list=text_context_list,
                                                chunk_id_filter=chunk_id_filter,
+                                               where_document_dict=where_document_dict,
                                                verbose=verbose)
     return docs_with_score
 
@@ -4308,6 +6303,7 @@ def _get_docs_with_score(query, k_db,
                          filter_kwargs,
                          db, db_type, text_context_list=None,
                          chunk_id_filter=None,
+                         where_document_dict={},
                          verbose=False):
     docs_with_score = []
 
@@ -4335,12 +6331,14 @@ def _get_docs_with_score(query, k_db,
         docs_with_score_chroma = sim_search(db, query=query, k=k_db, with_score=True,
                                             filter_kwargs=filter_kwargs,
                                             chunk_id_filter=chunk_id_filter,
+                                            where_document_dict=where_document_dict,
                                             verbose=verbose)
         docs_with_score += docs_with_score_chroma
         if verbose:
             print("sim_search in %s" % (time.time() - t0), flush=True)
     elif db is not None:
-        docs_with_score_other = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)
+        with get_context_cast():
+            docs_with_score_other = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)
         docs_with_score += docs_with_score_other
 
     # set in metadata original order of docs
@@ -4355,7 +6353,8 @@ def select_docs_with_score(docs_with_score, top_k_docs, one_doc_size):
     elif one_doc_size is not None:
         docs_with_score = [(docs_with_score[0][:one_doc_size], docs_with_score[0][1])]
     else:
-        docs_with_score = []
+        # do nothing
+        pass
     return docs_with_score
 
 
@@ -4370,15 +6369,19 @@ class H2OCharacterTextSplitter(RecursiveCharacterTextSplitter):
 
 def split_merge_docs(docs_with_score, tokenizer=None, max_input_tokens=None, docs_token_handling=None,
                      joiner=docs_joiner_default,
+                     non_doc_prompt='',
                      do_split=True,
                      verbose=False):
     # NOTE: Could use joiner=\n\n, but if PDF and continues, might want just  full continue with joiner=''
-    # NOTE: assume max_input_tokens already processed if was -1 and accounts for model_max_len
+    # NOTE: assume max_input_tokens already processed if was -1 and accounts for model_max_len and is per-llm call
+    if max_input_tokens is not None:
+        max_input_tokens -= get_token_count(non_doc_prompt, tokenizer)
+
     if docs_token_handling in ['chunk']:
         return docs_with_score, 0
     elif docs_token_handling in [None, 'split_or_merge']:
         assert tokenizer
-        tokens_before_split = [get_token_count(x + docs_joiner_default, tokenizer) for x in
+        tokens_before_split = [get_token_count(x + joiner, tokenizer) for x in
                                [x[0].page_content for x in docs_with_score]]
         # skip split if not necessary, since expensive for some reason
         do_split &= any([x > max_input_tokens for x in tokens_before_split])
@@ -4389,17 +6392,18 @@ def split_merge_docs(docs_with_score, tokenizer=None, max_input_tokens=None, doc
 
             # see if need to split
             # account for joiner tokens
-            joiner_tokens = get_token_count(docs_joiner_default, tokenizer)
-            chunk_size = max_input_tokens - joiner_tokens * len(docs_with_score)
+            joiner_tokens = get_token_count(joiner, tokenizer)
+            doc_chunk_size = max(64, min(max_input_tokens,
+                                         max(64, max_input_tokens - joiner_tokens * len(docs_with_score))))
             text_splitter = H2OCharacterTextSplitter.from_huggingface_tokenizer(
-                tokenizer, chunk_size=chunk_size, chunk_overlap=0
+                tokenizer, chunk_size=doc_chunk_size, chunk_overlap=0
             )
             [x[0].metadata.update(dict(docscore=x[1], doci=doci, ntokens=tokens_before_split[doci])) for doci, x in
              enumerate(docs_with_score)]
             docs = [x[0] for x in docs_with_score]
             # only split those that need to be split, else recursive splitter goes too nuts and takes too long
-            docs_to_split = [x for x in docs if x.metadata['ntokens'] > chunk_size]
-            docs_to_not_split = [x for x in docs if x.metadata['ntokens'] <= chunk_size]
+            docs_to_split = [x for x in docs if x.metadata['ntokens'] > doc_chunk_size]
+            docs_to_not_split = [x for x in docs if x.metadata['ntokens'] <= doc_chunk_size]
             docs_split_new = flatten_list([text_splitter.split_documents([x]) for x in docs_to_split])
             docs_new = docs_to_not_split + docs_split_new
             doci_new = [x.metadata['doci'] for x in docs_new]
@@ -4407,7 +6411,7 @@ def split_merge_docs(docs_with_score, tokenizer=None, max_input_tokens=None, doc
             docs_new = [x for _, x in sorted(zip(doci_new, docs_new), key=lambda pair: pair[0])]
             docs_with_score = [(x, x.metadata['docscore']) for x in docs_new]
 
-            tokens_after_split = [get_token_count(x + docs_joiner_default, tokenizer) for x in
+            tokens_after_split = [get_token_count(x + joiner, tokenizer) for x in
                                   [x[0].page_content for x in docs_with_score]]
             if verbose:
                 print('tokens_after_split=%s' % tokens_after_split, flush=True)
@@ -4423,7 +6427,8 @@ def split_merge_docs(docs_with_score, tokenizer=None, max_input_tokens=None, doc
             docs_with_score1 = select_docs_with_score(docs_with_score[k:], top_k_docs, one_doc_size)
             new_score = docs_with_score1[0][1]
             new_page_content = joiner.join([x[0].page_content for x in docs_with_score1])
-            new_metadata = docs_with_score1[0][0].metadata  # just use first chunk's metadata for now
+            new_metadata = docs_with_score1[0][0].metadata.copy()
+            new_metadata['source'] = joiner.join(set([x[0].metadata['source'] for x in docs_with_score1]))
             doc1 = Document(page_content=new_page_content, metadata=new_metadata)
             docs_with_score_new.append((doc1, new_score))
 
@@ -4435,7 +6440,7 @@ def split_merge_docs(docs_with_score, tokenizer=None, max_input_tokens=None, doc
             assert top_k_docs >= 1
             k += top_k_docs
 
-        tokens_after_merge = [get_token_count(x + docs_joiner_default, tokenizer) for x in
+        tokens_after_merge = [get_token_count(x + joiner, tokenizer) for x in
                               [x[0].page_content for x in docs_with_score_new]]
         if verbose:
             print('tokens_after_merge=%s' % tokens_after_merge, flush=True)
@@ -4487,19 +6492,23 @@ def run_hyde(*args, **kwargs):
     # get vars
     query = kwargs['query']
     sim_kwargs = kwargs['sim_kwargs']
-    run_target_func = kwargs['run_target_func']
+    run_target_func = kwargs['run_target_func_hyde']
     prompter = kwargs['prompter']
     hyde_level = kwargs['hyde_level']
+    hyde_llm_prompt = kwargs['hyde_llm_prompt']
     hyde_template = kwargs['hyde_template']
+    hyde_show_only_final = kwargs['hyde_show_only_final']
     verbose = kwargs['verbose']
     show_rank = kwargs['show_rank']
     answer_with_sources = kwargs['answer_with_sources']
     get_answer_kwargs = kwargs['get_answer_kwargs']
     append_sources_to_answer = kwargs['append_sources_to_answer']
+    append_sources_to_chat = kwargs['append_sources_to_chat']
     prompt_basic = kwargs['prompt_basic']
+    docs_joiner = kwargs['docs_joiner']
 
     # get llm answer
-    auto_hyde = """Answer this question with vibrant details in order for some NLP embedding model to use that answer as better query than original question: {query}"""
+    auto_hyde = """%s {query}""" % escape_braces(hyde_llm_prompt)
     if hyde_template in auto_choices:
         hyde_template = auto_hyde
     elif isinstance(hyde_template, str):
@@ -4515,11 +6524,14 @@ def run_hyde(*args, **kwargs):
     # no-doc chain first if done
     hyde_chain['query'] = hyde_template.format(query=query)
     hyde_chain['db'] = None
+    hyde_chain['load_db_if_exists'] = False
     hyde_chain['text_context_list'] = []
+    sources = []
+    answers = []
 
-    for hyde_level in range(hyde_level):
+    for hyde_level1 in range(hyde_level):
         if verbose:
-            print("hyde_level=%d embedding_query=%s" % (hyde_level, hyde_chain['query']), flush=True)
+            print("hyde_level1=%d embedding_query=%s" % (hyde_level1, hyde_chain['query']), flush=True)
 
         # run chain
         docs, chain, scores, \
@@ -4529,40 +6541,64 @@ def run_hyde(*args, **kwargs):
             get_chain(**hyde_chain)
 
         # get answer, updates llm_answers internally too
-        llm_answers_key = 'llm_answers_hyde_level_%d' % hyde_level
+        llm_answers_key = 'llm_answers_hyde_level_%d' % hyde_level1
         # for LLM, query remains same each time
-        answer = yield from run_target_func(query=query,
-                                            chain=chain,
-                                            llm=llm,
-                                            streamer=streamer,
-                                            prompter=prompter,
-                                            llm_answers=llm_answers,
-                                            llm_answers_key=llm_answers_key,
-                                            async_output=async_output,
-                                            only_new_text=only_new_text)
+        response_prefix = "Computing HYDE %d/%d response:\n------------------\n" % (1 + hyde_level1, hyde_level) \
+            if hyde_level1 < hyde_level else ''
+        answer = ''
+        for ret in run_target_func(query=query,
+                                   chain=chain,
+                                   llm=llm,
+                                   streamer=streamer,
+                                   prompter=prompter,
+                                   llm_answers=llm_answers,
+                                   llm_answers_key=llm_answers_key,
+                                   async_output=async_output,
+                                   only_new_text=only_new_text):
+            response = response_prefix + ret['response']
+            if not hyde_show_only_final:
+                pre_answer = get_hyde_acc(answer, llm_answers, get_answer_kwargs['hyde_show_intermediate_in_accordion'])
+                if pre_answer:
+                    response = pre_answer + response
+                yield dict(prompt_raw=ret['prompt'], response=response, sources=ret['sources'],
+                           num_prompt_tokens=ret['num_prompt_tokens'],
+                           llm_answers=ret['llm_answers'],
+                           # only give back no_refs if final
+                           response_no_refs='' if hyde_level1 < hyde_level else response,
+                           sources_str=ret['sources_str'])
+            answer = ret['response']
 
         if answer:
             # give back what have so far with any sources (what above yield doesn't do)
-            get_answer_args = tuple([query, docs,
-                                     answer,
+            get_answer_args = tuple([query, docs, answer,
+                                     llm_answers,
                                      scores, show_rank,
                                      answer_with_sources,
-                                     append_sources_to_answer])
-            ret, extra = get_sources_answer(*get_answer_args, **get_answer_kwargs)
+                                     append_sources_to_answer,
+                                     append_sources_to_chat])
+            ret, sources, ret_no_refs, sources_str = get_sources_answer(*get_answer_args, **get_answer_kwargs)
             # FIXME: Something odd, UI gets stuck and no more yields if pass these sources inside ret
             # https://github.com/gradio-app/gradio/issues/6100
             # print("ret: %s" % ret)
-            # yield dict(prompt=prompt_basic, response=ret, sources=extra, num_prompt_tokens=0, llm_answers=llm_answers)
+            # yield dict(prompt=prompt_basic, response=ret, sources=sources, num_prompt_tokens=0, llm_answers=llm_answers)
             # try yield after
             # print("answer: %s" % answer)
-            yield dict(prompt=prompt_basic, response=answer, sources=extra, num_prompt_tokens=0,
-                       llm_answers=llm_answers)
+            if not hyde_show_only_final:
+                yield dict(prompt_raw=prompt_basic, response=ret_no_refs, sources=sources, num_prompt_tokens=0,
+                           llm_answers=llm_answers,
+                           response_no_refs='' if hyde_level1 < hyde_level else ret_no_refs,
+                           sources_str=sources_str)
 
             # update embedding query
-            hyde_chain['query_embedding'] = hyde_higher_template.format(query=query, answer=answer)
+            # use all answers, but use newer answers first, often shorter due to LLM RLHF not used to long docs inputted,
+            # then add rest and will be truncated at end
+            answers.append(answer)
+            answers_reverse = docs_joiner.join(answers[::-1])
+            hyde_chain['query_embedding'] = hyde_higher_template.format(query=query, answer=answers_reverse)
         # update hyde_chain with doc version from now on
         hyde_chain['db'] = kwargs['db']
         hyde_chain['text_context_list'] = kwargs['text_context_list']
+        hyde_chain['load_db_if_exists'] = True
 
     return hyde_chain['query_embedding'], llm_answers
 
@@ -4572,12 +6608,15 @@ def get_chain(query=None,
               iinput=None,
               context=None,  # FIXME: https://github.com/hwchase17/langchain/issues/6638
               use_openai_model=False, use_openai_embedding=False,
+              langchain_instruct_mode=True,
               first_para=False, text_limit=None, top_k_docs=4, chunk=True, chunk_size=512,
 
               # urls
               use_unstructured=True,
               use_playwright=False,
               use_selenium=False,
+              use_scrapeplaywright=False,
+              use_scrapehttp=False,
 
               # pdfs
               use_pymupdf='auto',
@@ -4592,13 +6631,20 @@ def get_chain(query=None,
               enable_doctr=False,
               enable_pix2struct=False,
               enable_captions=True,
+              enable_llava=True,
+              enable_transcriptions=True,
               captions_model=None,
               caption_loader=None,
               doctr_loader=None,
               pix2struct_loader=None,
+              llava_model=None,
+              llava_prompt=None,
+              asr_model=None,
+              asr_loader=None,
 
               # json
               jq_schema='.[]',
+              extract_frames=10,
 
               langchain_mode_paths=None,
               langchain_mode_types=None,
@@ -4615,10 +6661,12 @@ def get_chain(query=None,
               prompt_type=None,
               prompt_dict=None,
               system_prompt=None,
+              allow_chat_system_prompt=None,
               cut_distance=1.1,
               add_chat_history_to_context=True,  # FIXME: https://github.com/hwchase17/langchain/issues/6638
               add_search_to_context=False,
               keep_sources_in_context=False,
+              gradio_errors_to_chatbot=True,
               memory_restriction_level=0,
               top_k_docs_max_show=10,
 
@@ -4629,10 +6677,16 @@ def get_chain(query=None,
               langchain_agents=None,
               document_subset=DocumentSubset.Relevant.name,
               document_choice=[DocumentChoice.ALL.value],
+              document_source_substrings=[],
+              document_source_substrings_op='and',
+              document_content_substrings=[],
+              document_content_substrings_op='and',
+
               pre_prompt_query=None,
               prompt_query=None,
               pre_prompt_summary=None,
               prompt_summary=None,
+              hyde_llm_prompt=None,
               text_context_list=None,
               chat_conversation=None,
 
@@ -4647,27 +6701,33 @@ def get_chain(query=None,
               tokenizer=None,
               verbose=False,
               docs_ordering_type=docs_ordering_types_default,
-              min_max_new_tokens=256,
+              min_max_new_tokens=512,
               max_input_tokens=-1,
+              max_total_input_tokens=-1,
               attention_sinks=False,
               truncation_generation=False,
               docs_token_handling=None,
               docs_joiner=None,
+              doc_json_mode=False,
+              metadata_in_context=[],
 
               stream_output=True,
               async_output=True,
               gradio_server=False,
 
+              hyde_level=None,
+
               # local
               auto_reduce_chunks=True,
               max_chunks=100,
-              total_tokens_for_docs=None,
               use_llm_if_no_docs=None,
               headsize=50,
               max_time=None,
 
               query_action=None,
               summarize_action=None,
+
+              doing_grounding=False,
               ):
     if inference_server is None:
         inference_server = ''
@@ -4683,13 +6743,11 @@ def get_chain(query=None,
     else:
         # these don't support allowing going beyond total context
         truncation_generation = True
-
     # default nothing
     docs = []
     target = None
     scores = []
     num_docs_before_cut = 0
-    use_llm_if_no_docs = True
 
     if len(text_context_list) > 0:
         # turn into documents to make easy to manage and add meta
@@ -4697,7 +6755,7 @@ def get_chain(query=None,
         chunk_id = 0 if query_action else -1
         text_context_list = [
             Document(page_content=x, metadata=dict(source='text_context_list', score=1.0, chunk_id=chunk_id)) for x
-            in text_context_list]
+            in text_context_list if x]
 
     if add_search_to_context:
         params = {
@@ -4716,6 +6774,148 @@ def get_chain(query=None,
         text_context_list = docs_search + text_context_list
         add_search_to_context &= len(docs_search) > 0
         top_k_docs_max_show = max(top_k_docs_max_show, len(docs_search))
+
+    if LangChainAgent.AUTOGPT.value in langchain_agents:
+        from langchain_experimental.autonomous_agents.autogpt.agent import AutoGPT
+        from langchain.agents import load_tools
+
+        search_tools1 = load_tools(["ddg-search"], llm=llm)
+        search_tools2 = load_tools(["serpapi"], llm=llm, serpapi_api_key=os.environ.get('SERPAPI_API_KEY'))
+        search_tools = search_tools1 + search_tools2
+
+        from langchain_community.tools import WikipediaQueryRun
+        from langchain_community.utilities import WikipediaAPIWrapper
+        api_wrapper = WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=chunk_size)
+        wiki_tools = [WikipediaQueryRun(api_wrapper=api_wrapper)]
+
+        # from langchain_community.tools.file_management.read import ReadFileTool
+        # from langchain_community.tools.file_management.write import WriteFileTool
+        # file_tools = [WriteFileTool(), ReadFileTool()]
+        from langchain_community.tools import ShellTool
+        shell_tool = ShellTool()
+        shell_tool.description = shell_tool.description + f"args {shell_tool.args}".replace(
+            "{", "{{"
+        ).replace("}", "}}")
+        shell_tools = [shell_tool]
+
+        from langchain_community.agent_toolkits import FileManagementToolkit
+        # from tempfile import TemporaryDirectory
+        # working_directory = TemporaryDirectory().name
+        working_directory = "autogpt_files"
+        makedirs(working_directory)
+        toolkit = FileManagementToolkit(
+            root_dir=str(working_directory)
+        )  # If you don't provide a root_dir, operations will default to the current working directory
+        file_tools = toolkit.get_tools()
+
+        from gradio_tools.tools import (
+            ImageCaptioningTool,
+            StableDiffusionPromptGeneratorTool,
+            StableDiffusionTool,
+            TextToVideoTool,
+        )
+        do_image_tools = False  # FIXME: times out and blocks everything
+        if do_image_tools:
+            image_tools = [
+                StableDiffusionTool().langchain,
+                ImageCaptioningTool().langchain,
+                StableDiffusionPromptGeneratorTool().langchain,
+                TextToVideoTool().langchain,
+            ]
+        else:
+            image_tools = []
+
+        from langchain_experimental.utilities import PythonREPL
+        python_repl = PythonREPL()
+        # You can create the tool to pass to an agent
+        from langchain.agents import Tool
+        repl_tool = Tool(
+            name="python_repl",
+            description="A Python shell. Use this to execute python commands. Input should be a valid python command. If you want to see the output of a value, you should print it out with `print(...)`.",
+            func=python_repl.run,
+        )
+
+        requests_tools = load_tools(["requests_all"])
+
+        from langchain_community.utilities.wolfram_alpha import WolframAlphaAPIWrapper
+        wolfram = WolframAlphaAPIWrapper()
+        wolfram_tool = Tool(
+            name="wolframalpha",
+            description="WolframAlpha is an answer engine developed by Wolfram Research. It answers factual queries by computing answers from externally sourced data.",
+            func=wolfram.run,
+        )
+
+        from langchain_experimental.llm_symbolic_math.base import LLMSymbolicMathChain
+        sympy_math = LLMSymbolicMathChain.from_llm(llm)
+        sympy_tool = Tool(
+            name="sympy",
+            description="SymPy is a Python library for symbolic mathematics. It aims to become a full-featured computer algebra system (CAS) while keeping the code as simple as possible in order to be comprehensible and easily extensible.",
+            func=sympy_math.run,
+        )
+
+        enable_semantictool = False  # FIXME: Hit Can't patch loop of type <class 'uvloop.Loop'>
+        if enable_semantictool:
+            # from langchain_community.utilities.semanticscholar import SemanticScholarAPIWrapper
+            # semantic = SemanticScholarAPIWrapper()
+            # So can pass API key as ENV: S2_API_KEY
+            from utils_langchain import H2OSemanticScholarAPIWrapper
+            semantic = H2OSemanticScholarAPIWrapper()
+            scholar_tool = Tool(
+                name="semantictool",
+                description="Semantic Scholar is a searchable database that uses AI to search and discover academic papers. It's supported by the Allen Institute for AI and indexes over 200 million academic papers.",
+                func=semantic.run,
+            )
+            scholar_tools = [scholar_tool]
+        else:
+            scholar_tools = []
+
+        tools = ([]
+                 + search_tools
+                 + wiki_tools
+                 + shell_tools
+                 + file_tools
+                 + [repl_tool]
+                 + requests_tools
+                 + scholar_tools
+                 + image_tools
+                 )
+        if os.getenv('WOLFRAM_ALPHA_APPID'):
+            tools.extend([wolfram_tool])
+        else:
+            tools.extend([sympy_tool])
+
+        from langchain_community.docstore import InMemoryDocstore
+        from langchain_community.embeddings import OpenAIEmbeddings
+        from langchain_community.vectorstores import FAISS
+
+        # Define your embedding model
+        embeddings_model = OpenAIEmbeddings()
+        # Initialize the vectorstore as empty
+        import faiss
+
+        embedding_size = 1536
+        index = faiss.IndexFlatL2(embedding_size)
+        vectorstore = FAISS(embeddings_model.embed_query, index, InMemoryDocstore({}), {})
+
+        agent = AutoGPT.from_llm_and_tools(
+            ai_name="h2oAutoGPT",
+            ai_role="General Search and Knowledge Assistant",
+            tools=tools,
+            llm=llm,
+            memory=vectorstore.as_retriever(),
+        )
+        # Set verbose to be true
+        agent.chain.verbose = True
+        chain_kwargs = [query]
+        chain_func = agent.run
+        target = wrapped_partial(chain_func, chain_kwargs)
+
+        docs = []
+        scores = []
+        num_docs_before_cut = 0
+        use_llm_if_no_docs = True
+        return docs, target, scores, num_docs_before_cut, use_llm_if_no_docs, top_k_docs_max_show, \
+            llm, model_name, streamer, prompt_type_out, async_output, only_new_text
 
     if LangChainAgent.SMART.value in langchain_agents:
         # doesn't really work for non-OpenAI models unless larger
@@ -4749,11 +6949,9 @@ def get_chain(query=None,
             llm, model_name, streamer, prompt_type_out, async_output, only_new_text
 
     from src.output_parser import H2OMRKLOutputParser
-    from langchain.agents import AgentType, load_tools, initialize_agent, create_vectorstore_agent, \
-        create_pandas_dataframe_agent, create_json_agent, create_csv_agent
-    from langchain.agents.agent_toolkits import VectorStoreInfo, VectorStoreToolkit, create_python_agent, JsonToolkit
     if LangChainAgent.SEARCH.value in langchain_agents:
         output_parser = H2OMRKLOutputParser()
+        from langchain.agents import load_tools, AgentType, initialize_agent
         tools = load_tools(["serpapi"], llm=llm, serpapi_api_key=os.environ.get('SERPAPI_API_KEY'))
         if does_support_functiontools(inference_server, model_name):
             agent_type = AgentType.OPENAI_FUNCTIONS
@@ -4781,13 +6979,16 @@ def get_chain(query=None,
 
     if LangChainAgent.COLLECTION.value in langchain_agents:
         if db:
+            from langchain.agents.agent_toolkits import VectorStoreInfo, VectorStoreToolkit
+            from langchain.agents import create_vectorstore_agent
+
             output_parser = H2OMRKLOutputParser()
             vectorstore_info = VectorStoreInfo(
                 name=langchain_mode,
                 description="DataBase of text from PDFs, Image Captions, or web URL content",
                 vectorstore=db,
             )
-            toolkit = VectorStoreToolkit(vectorstore_info=vectorstore_info)
+            toolkit = VectorStoreToolkit(vectorstore_info=vectorstore_info, llm=llm)
             chain = create_vectorstore_agent(llm=llm, toolkit=toolkit,
                                              agent_executor_kwargs=dict(output_parser=output_parser),
                                              verbose=True, max_execution_time=max_time)
@@ -4802,6 +7003,8 @@ def get_chain(query=None,
     if LangChainAgent.PYTHON.value in langchain_agents:
         # non-thread safe things inside worker, but only after in fork, so ok
         if does_support_functiontools(inference_server, model_name):
+            from langchain.agents import AgentType
+            from langchain_experimental.agents.agent_toolkits import create_python_agent
             chain = create_python_agent(
                 llm=llm,
                 tool=PythonREPLTool(),
@@ -4818,16 +7021,22 @@ def get_chain(query=None,
         return docs, target, scores, num_docs_before_cut, use_llm_if_no_docs, top_k_docs_max_show, \
             llm, model_name, streamer, prompt_type_out, async_output, only_new_text
 
+    prefix_functiontools_csv = """You are working with a pandas dataframe in Python.  The name of the dataframe is: df.  Assume every question is about the dataframe, for example Describe means to describe or summarize the dataframe contents using the python_repl_ast tool.  Action input requests the tool to use, and only use the action python_repl_ast with valid JSON."""
+    prefix_react_csv = """You are working with a pandas dataframe in Python.  The name of the dataframe is: df.  Assume every question is about the dataframe, for example Describe means to describe or summarize the dataframe contents using the python_repl_ast tool.  For Action, only use python_repl_ast.  For Action input, specify the python interpreter code in pandas you want to perform."""
+
     if LangChainAgent.PANDAS.value in langchain_agents:
         document_choice = get_single_document(document_choice, db, extension='csv')
         if document_choice and does_support_functiontools(inference_server, model_name):
+            from langchain.agents import AgentType
             df = pd.read_csv(document_choice)
             chain = create_pandas_dataframe_agent(
                 llm,
                 df,
-                verbose=True,
+                verbose=verbose,
                 agent_type=AgentType.OPENAI_FUNCTIONS,
                 max_execution_time=max_time,
+                prefix=prefix_functiontools_csv,
+                agent_executor_kwargs=dict(handle_parsing_errors=True),
             )
 
             chain_kwargs = dict(input=query)
@@ -4848,10 +7057,16 @@ def get_chain(query=None,
             with open(document_choice[0], 'rt') as f:
                 data = json.loads(f.read())
             json_spec = JsonSpec(dict_=data, max_value_length=4000)
-            json_toolkit = JsonToolkit(spec=json_spec)
 
+            from langchain_community.agent_toolkits import JsonToolkit
+            from langchain.agents import create_json_agent
+
+            json_toolkit = JsonToolkit(spec=json_spec)
             chain = create_json_agent(
-                llm=llm, toolkit=json_toolkit, verbose=True, max_execution_time=max_time,
+                llm=llm, toolkit=json_toolkit,
+                verbose=verbose,
+                max_execution_time=max_time,
+                agent_executor_kwargs=dict(handle_parsing_errors=True),
             )
 
             chain_kwargs = dict(input=query)
@@ -4868,18 +7083,35 @@ def get_chain(query=None,
         document_choice = get_single_document(document_choice, db, extension='csv')
         if document_choice:
             if does_support_functiontools(inference_server, model_name):
+                from langchain.agents import AgentType
                 chain = create_csv_agent(
                     llm,
                     document_choice,
-                    verbose=True, max_execution_time=max_time,
+                    prefix=prefix_functiontools_csv,
+                    verbose=verbose, max_execution_time=max_time,
                     agent_type=AgentType.OPENAI_FUNCTIONS,
+                    agent_executor_kwargs=dict(handle_parsing_errors=True),
                 )
             else:
+                output_parser = H2OPythonMRKLOutputParser()
+                from langchain.agents import AgentType
                 chain = create_csv_agent(
                     llm,
                     document_choice,
-                    verbose=True, max_execution_time=max_time,
+                    prefix=prefix_react_csv,
+                    number_of_head_rows=1,
+                    verbose=verbose, max_execution_time=max_time,
                     agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                    output_parser=output_parser,
+                    format_instructions=output_parser.get_format_instructions(),
+                    agent_kwargs=dict(handle_parsing_errors=True,
+                                      output_parser=output_parser,
+                                      format_instructions=output_parser.get_format_instructions(),
+                                      ),
+                    agent_executor_kwargs=dict(handle_parsing_errors=True,
+                                               output_parser=output_parser,
+                                               format_instructions=output_parser.get_format_instructions(),
+                                               ),
                 )
             chain_kwargs = dict(input=query)
             target = wrapped_partial(chain, chain_kwargs)
@@ -4923,6 +7155,8 @@ def get_chain(query=None,
                                                         use_unstructured=use_unstructured,
                                                         use_playwright=use_playwright,
                                                         use_selenium=use_selenium,
+                                                        use_scrapeplaywright=use_scrapeplaywright,
+                                                        use_scrapehttp=use_scrapehttp,
 
                                                         # pdfs
                                                         use_pymupdf=use_pymupdf,
@@ -4937,13 +7171,20 @@ def get_chain(query=None,
                                                         enable_doctr=enable_doctr,
                                                         enable_pix2struct=enable_pix2struct,
                                                         enable_captions=enable_captions,
+                                                        enable_llava=enable_llava,
+                                                        enable_transcriptions=enable_transcriptions,
                                                         captions_model=captions_model,
                                                         caption_loader=caption_loader,
                                                         doctr_loader=doctr_loader,
                                                         pix2struct_loader=pix2struct_loader,
+                                                        llava_model=llava_model,
+                                                        llava_prompt=llava_prompt,
+                                                        asr_model=asr_model,
+                                                        asr_loader=asr_loader,
 
                                                         # json
                                                         jq_schema=jq_schema,
+                                                        extract_frames=extract_frames,
 
                                                         langchain_mode=langchain_mode,
                                                         langchain_mode_paths=langchain_mode_paths,
@@ -4953,27 +7194,43 @@ def get_chain(query=None,
                                                         db=db,
                                                         n_jobs=n_jobs,
                                                         verbose=verbose)
-    num_docs_before_cut = 0
-    use_template = not use_openai_model and prompt_type not in ['plain'] or langchain_only_model
+    use_template = not use_openai_model and langchain_instruct_mode or langchain_only_model
     template, template_if_no_docs, auto_reduce_chunks, query = \
         get_template(query, iinput,
                      pre_prompt_query, prompt_query,
                      pre_prompt_summary, prompt_summary,
                      langchain_action,
+                     query_action,
+                     summarize_action,
                      True,  # just to overestimate prompting
                      auto_reduce_chunks,
-                     add_search_to_context)
+                     add_search_to_context,
+                     system_prompt,
+                     doc_json_mode,
+                     prompter=prompter)
 
-    # use min_max_new_tokens instead of max_new_tokens for max_new_tokens to get largest input allowable
-    # else max_input_tokens interpreted as user input as smaller than possible and get over-restricted
-    max_input_tokens_default = get_max_input_tokens(llm=llm, tokenizer=tokenizer, inference_server=inference_server,
-                                                    model_name=model_name, max_new_tokens=min_max_new_tokens)
-    if max_input_tokens >= 0:
-        max_input_tokens = min(max_input_tokens_default, max_input_tokens)
-    else:
-        max_input_tokens = max_input_tokens_default
     model_max_length = get_model_max_length(llm=llm, tokenizer=tokenizer, inference_server=inference_server,
                                             model_name=model_name)
+
+    if not attention_sinks:
+        # use min_max_new_tokens instead of max_new_tokens for max_new_tokens to get the largest input allowable
+        #  else max_input_tokens interpreted as user input as smaller than possible and get over-restricted
+        # but if summarization, this defines max tokens in each chunk, for same used max_new_tokens, so need to use original,
+        #  e.g. first map may produce some output, larger than 256 tokens, and upon reduce includes that large output, which won't work for same large max_new_tokens -> max_input_tokens
+        if query_action:
+            max_new_tokens_used = min_max_new_tokens
+        else:
+            max_new_tokens_used = max_new_tokens
+        max_input_tokens_default = get_max_input_tokens(llm=llm, tokenizer=tokenizer, inference_server=inference_server,
+                                                        model_name=model_name, max_new_tokens=max_new_tokens_used)
+        if max_input_tokens >= 0:
+            max_input_tokens = min(max_input_tokens_default, max_input_tokens)
+        else:
+            max_input_tokens = max_input_tokens_default
+
+    else:
+        if max_input_tokens < 0:
+            max_input_tokens = model_max_length
 
     if hasattr(db, '_persist_directory'):
         lock_file = get_db_lock_file(db, lock_type='sim')
@@ -4990,7 +7247,19 @@ def get_chain(query=None,
         chunk_id_filter = None
         filter_kwargs = {}
         filter_kwargs_backup = {}
+        where_document_dict = {}
     else:
+        where_document_dict = {}
+        if document_content_substrings:
+            if len(document_content_substrings) > 1:
+                inner_list = [{'$contains': x} for x in document_content_substrings]
+                if document_content_substrings_op == 'or':
+                    where_document = {"$or": inner_list}
+                else:
+                    where_document = {"$and": inner_list}
+            else:
+                where_document = {'$contains': document_content_substrings[0]}
+            where_document_dict = dict(where_document=where_document)
         import logging
         logging.getLogger("chromadb").setLevel(logging.ERROR)
         assert document_choice is not None, "Document choice was None"
@@ -5015,6 +7284,10 @@ def get_chain(query=None,
                             "$and": [dict(source={"$eq": x}), dict(chunk_id={"$eq": -1})]}
                         for x in document_choice]
                     filter_kwargs = dict(filter={"$or": or_filter})
+                    or_filter_backup = [
+                        dict(source={"$eq": x}) if query_action else dict(source={"$eq": x})
+                        for x in document_choice]
+                    filter_kwargs_backup = dict(filter={"$or": or_filter_backup})
                 else:
                     chunk_id_filter = None
                     # still chromadb UX bug, have to do different thing for 1 vs. 2+ docs when doing filter
@@ -5027,6 +7300,14 @@ def get_chain(query=None,
 
                     filter_kwargs = dict(filter={"$and": [dict(source=one_filter['source']),
                                                           dict(chunk_id=one_filter['chunk_id'])]})
+                    one_filter_backup = \
+                        [{"source": {"$eq": x}, "chunk_id": {"$gte": 0}} if query_action else {
+                            "source": {"$eq": x},
+                            "chunk_id": {
+                                "$eq": -1}}
+                         for x in document_choice][0]
+
+                    filter_kwargs_backup = dict(filter=dict(source=one_filter_backup['source']))
         else:
             # migration for chroma < 0.4
             if len(document_choice) == 0 or len(document_choice) >= 1 and document_choice[
@@ -5117,22 +7398,80 @@ def get_chain(query=None,
         docs = [x[0] for x in docs_with_score]
         scores = [x[1] for x in docs_with_score]
     else:
+        # avoid lock if fake embeddings or faiss etc., since no complex db
+        lock_func = filelock.FileLock if hasattr(db, '_persist_directory') else NullContext
         # have query
         # for db=None too
-        with filelock.FileLock(lock_file):
+        with lock_func(lock_file):
             docs_with_score = get_docs_with_score(query_embedding, k_db,
                                                   filter_kwargs,
                                                   filter_kwargs_backup,
                                                   db, db_type,
                                                   text_context_list=text_context_list,
                                                   chunk_id_filter=chunk_id_filter,
+                                                  where_document_dict=where_document_dict,
                                                   verbose=verbose)
+            if document_source_substrings:
+                set_document_source_substrings = set(document_source_substrings)
+                if document_source_substrings_op == 'or':
+                    docs_with_score = [x for x in docs_with_score if
+                                       any(y in x[0].metadata.get('source') for y in set_document_source_substrings)]
+                else:
+                    docs_with_score = [x for x in docs_with_score if
+                                       all(y in x[0].metadata.get('source') for y in set_document_source_substrings)]
+
+    if metadata_in_context is None:
+        metadata_in_context = []
+    if db is None and text_context_list:
+        # not useful then, just mess
+        metadata_in_context = []
+    elif not metadata_in_context:
+        metadata_in_context = []
+    elif isinstance(metadata_in_context, str) and metadata_in_context not in ['all', 'auto']:
+        metadata_in_context = ast.literal_eval(metadata_in_context)
+        assert isinstance(metadata_in_context, list)
+
+    if metadata_in_context == 'all':
+        metadata_in_context_set = FullSet()
+    elif metadata_in_context == 'auto':
+        metadata_in_context_set = set(
+            ['date', 'file_path', 'input_type', 'keywords', 'chunk_id', 'page', 'source', 'title', 'total_pages'])
+    else:
+        assert isinstance(metadata_in_context, list)
+        metadata_in_context_set = set(metadata_in_context)
 
     # SELECT PROMPT + DOCS
 
     tokenizer = get_tokenizer(db=db, llm=llm, tokenizer=tokenizer, inference_server=inference_server,
                               use_openai_model=use_openai_model,
                               db_type=db_type)
+
+    get_limited_prompt_func = functools.partial(get_limited_prompt,
+                                                prompter=prompter,
+                                                base_model=model_name,
+                                                inference_server=inference_server,
+                                                prompt_type=prompt_type,
+                                                prompt_dict=prompt_dict,
+                                                max_new_tokens=max_new_tokens,
+                                                system_prompt=system_prompt,
+                                                allow_chat_system_prompt=allow_chat_system_prompt,
+                                                context=context,
+                                                chat_conversation=chat_conversation,
+                                                keep_sources_in_context=keep_sources_in_context,
+                                                gradio_errors_to_chatbot=gradio_errors_to_chatbot,
+                                                model_max_length=model_max_length,
+                                                memory_restriction_level=memory_restriction_level,
+                                                langchain_mode=langchain_mode,
+                                                add_chat_history_to_context=add_chat_history_to_context,
+                                                min_max_new_tokens=min_max_new_tokens,
+                                                max_input_tokens=max_input_tokens,
+                                                truncation_generation=truncation_generation,
+                                                gradio_server=gradio_server,
+                                                attention_sinks=attention_sinks,
+                                                hyde_level=hyde_level,
+                                                doing_grounding=doing_grounding,
+                                                )
+
     # NOTE: if map_reduce, then no need to auto reduce chunks
     if query_action and (top_k_docs == -1 or auto_reduce_chunks):
         top_k_docs_tokenize = 100
@@ -5141,45 +7480,44 @@ def get_chain(query=None,
             estimated_prompt_no_docs = template.format(context='', question=query)
         else:
             estimated_prompt_no_docs = template_if_no_docs.format(context='', question=query)
-        chat = True  # FIXME?
+
+        # add metadata to documents and make new copy of docs with them to not contaminate originals
+        if metadata_in_context and not doc_json_mode and not doing_grounding:
+            docs_with_score = [(Document(page_content='Begin Document:\n\n' +
+                                                      'Metadata:\n' +
+                                                      '\n'.join(['%s = %s' % (k, v) for k, v in x.metadata.items() if
+                                                                 v and k in metadata_in_context_set]) +
+                                                      '\n\nDocument Contents:\n"""\n' +
+                                                      x.page_content +
+                                                      '\n"""\nEnd Document\n',
+                                         metadata=copy.deepcopy(x.metadata) or {}), score)
+                               for x, score in docs_with_score]
 
         # first docs_with_score are most important with highest score
         estimated_full_prompt, \
-            instruction, iinput, context, \
+            query, iinput, context, \
             num_prompt_tokens, max_new_tokens, \
             num_prompt_tokens0, num_prompt_tokens_actual, \
-            chat_index, external_handle_chat_conversation, \
+            history_to_use_final, external_handle_chat_conversation, \
             top_k_docs_trial, one_doc_size, \
-            truncation_generation = \
-            get_limited_prompt(estimated_prompt_no_docs,
-                               iinput,
-                               tokenizer,
-                               prompter=prompter,
-                               inference_server=inference_server,
-                               prompt_type=prompt_type,
-                               prompt_dict=prompt_dict,
-                               chat=chat,
-                               max_new_tokens=max_new_tokens,
-                               system_prompt=system_prompt,
-                               context=context,
-                               chat_conversation=chat_conversation,
-                               text_context_list=[x[0].page_content for x in docs_with_score],
-                               keep_sources_in_context=keep_sources_in_context,
-                               model_max_length=model_max_length,
-                               memory_restriction_level=memory_restriction_level,
-                               langchain_mode=langchain_mode,
-                               add_chat_history_to_context=add_chat_history_to_context,
-                               min_max_new_tokens=min_max_new_tokens,
-                               max_input_tokens=max_input_tokens,
-                               truncation_generation=truncation_generation,
-                               gradio_server=gradio_server,
-                               )
+            truncation_generation, system_prompt = get_limited_prompt_func(query,
+                                                                           iinput,
+                                                                           tokenizer,
+                                                                           estimated_instruction=estimated_prompt_no_docs,
+                                                                           text_context_list=[x[0].page_content for x in
+                                                                                              docs_with_score],
+                                                                           )
         # get updated llm
-        llm_kwargs.update(max_new_tokens=max_new_tokens, context=context, iinput=iinput)
+        llm_kwargs.update(max_new_tokens=max_new_tokens,
+                          max_input_tokens=max_input_tokens,
+                          max_total_input_tokens=max_total_input_tokens,
+                          context=context,
+                          iinput=iinput,
+                          system_prompt=system_prompt)
         if external_handle_chat_conversation:
             # should already have attribute, checking sanity
             assert hasattr(llm, 'chat_conversation')
-            llm_kwargs.update(chat_conversation=chat_conversation[chat_index:])
+            llm_kwargs.update(chat_conversation=history_to_use_final)
         llm, model_name, streamer, prompt_type_out, async_output, only_new_text, gradio_server = \
             get_llm(**llm_kwargs)
 
@@ -5193,41 +7531,72 @@ def get_chain(query=None,
         elif top_k_docs_trial >= max_chunks:
             top_k_docs = max_chunks
         docs_with_score = select_docs_with_score(docs_with_score, top_k_docs, one_doc_size)
-    elif query_action:
-        # no limitation or auto-filling, just literal top_k_docs
-        docs_with_score = select_docs_with_score(docs_with_score, top_k_docs, None)
     else:
-        assert not query_action and summarize_action, "Bad action"
+        # don't reduce, except listen to top_k_docs and max_total_input_tokens
         one_doc_size = None
-        if total_tokens_for_docs is not None:
-            # used to limit tokens for summarization, e.g. public instance
+        if max_total_input_tokens not in [None, -1]:
+            # used to limit tokens for summarization, e.g. public instance, over all LLM calls allowed
             top_k_docs, one_doc_size, num_doc_tokens = \
                 get_docs_tokens(tokenizer,
                                 text_context_list=[x[0].page_content for x in docs_with_score],
-                                max_input_tokens=total_tokens_for_docs)
+                                max_input_tokens=max_total_input_tokens)
         # filter by top_k_docs and maybe one_doc_size
         docs_with_score = select_docs_with_score(docs_with_score, top_k_docs, one_doc_size)
-        # group docs if desired/can to fill context
+
+    if summarize_action:
+        if langchain_action in [LangChainAction.SUMMARIZE_MAP.value, LangChainAction.EXTRACT.value]:
+            estimated_prompt_no_docs = template.format(text='', question=query)
+        else:
+            estimated_prompt_no_docs = template.format(input_documents='', question=query)
+
+        # first docs_with_score are most important with highest score
+        estimated_full_prompt, \
+            _, _, _, \
+            _, _, \
+            _, _, \
+            _, _, \
+            _, _, \
+            _, _ = get_limited_prompt_func(estimated_prompt_no_docs,
+                                           iinput,
+                                           tokenizer,
+                                           estimated_instruction=estimated_prompt_no_docs,
+                                           text_context_list=[],
+                                           # nothing, just getting base amount for each call
+                                           )
+
+        # group docs if desired/can to fill context to avoid multiple LLM calls or too large chunks
         docs_with_score, max_doc_tokens = split_merge_docs(docs_with_score,
                                                            tokenizer,
                                                            max_input_tokens=max_input_tokens,
                                                            docs_token_handling=docs_token_handling,
-                                                           joiner=docs_joiner,
+                                                           joiner=docs_joiner if not doing_grounding else "Document xx",
+                                                           non_doc_prompt=estimated_full_prompt,
                                                            verbose=verbose)
+        # in case docs_with_score grew due to splitting, limit again by top_k_docs
+        if top_k_docs > 0:
+            docs_with_score = docs_with_score[:top_k_docs]
         # max_input_tokens used min_max_new_tokens as max_new_tokens, so need to assume filled up to that
         # but use actual largest token count
-        data_point = dict(context=context, instruction=query, input=iinput)
+        if '{text}' in template:
+            estimated_prompt_no_docs = template.format(text='')
+        elif '{input_documents}' in template:
+            estimated_prompt_no_docs = template.format(input_documents='')
+        elif '{question}' in template:
+            estimated_prompt_no_docs = template.format(question=query)
+        else:
+            estimated_prompt_no_docs = query
+        data_point = dict(context=context, instruction=estimated_prompt_no_docs or ' ', input=iinput)
         prompt_basic = prompter.generate_prompt(data_point)
-        estimated_prompt_no_docs = template.format(text=prompt_basic)
-        num_prompt_basic_tokens = get_token_count(estimated_prompt_no_docs, tokenizer)
+        num_prompt_basic_tokens = get_token_count(prompt_basic, tokenizer)
 
         if truncation_generation:
-            max_new_tokens = model_max_length - max_doc_tokens - num_prompt_basic_tokens
+            max_new_tokens = max(min_max_new_tokens,
+                                 min(max_new_tokens, model_max_length - max_doc_tokens - num_prompt_basic_tokens))
             if os.getenv('HARD_ASSERTS') is not None:
                 # imperfect calculation, so will see how testing does
                 assert max_new_tokens >= min_max_new_tokens - 50, "%s %s" % (max_new_tokens, min_max_new_tokens)
         # get updated llm
-        llm_kwargs.update(max_new_tokens=max_new_tokens)
+        llm_kwargs.update(max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens)
         llm, model_name, streamer, prompt_type_out, async_output, only_new_text, gradio_server = \
             get_llm(**llm_kwargs)
 
@@ -5289,24 +7658,91 @@ def get_chain(query=None,
                      pre_prompt_query, prompt_query,
                      pre_prompt_summary, prompt_summary,
                      langchain_action,
+                     query_action,
+                     summarize_action,
                      got_any_docs,
                      auto_reduce_chunks,
-                     add_search_to_context)
+                     add_search_to_context,
+                     system_prompt,
+                     doc_json_mode,
+                     prompter=prompter)
+
+    if doc_json_mode:
+        # make copy so don't change originals
+        if metadata_in_context and not doing_grounding:
+            docs = [Document(page_content=json.dumps(merge_dict(dict(ID=xi, content=x.page_content),
+                                                                {k: v for k, v in x.metadata.items() if
+                                                                 v and k in metadata_in_context_set})),
+                             metadata=copy.deepcopy(x.metadata) or {})
+                    for xi, x in enumerate(docs)]
+        else:
+            docs = [Document(page_content=json.dumps(dict(ID=xi, content=x.page_content)),
+                             metadata=copy.deepcopy(x.metadata) or {})
+                    for xi, x in enumerate(docs)]
 
     if langchain_action == LangChainAction.QUERY.value:
-        if use_template:
-            # instruct-like, rather than few-shot prompt_type='plain' as default
-            # but then sources confuse the model with how inserted among rest of text, so avoid
+        if doing_grounding:
+            # https://huggingface.co/CohereForAI/c4ai-command-r-v01
             prompt = PromptTemplate(
                 # input_variables=["summaries", "question"],
                 input_variables=["context", "question"],
-                template=template,
+                template='{context}{question}',  # ignored
             )
             chain = load_qa_chain(llm, prompt=prompt, verbose=verbose)
+            from openai_server.backend_utils import structure_to_messages
+
+            while True:
+                conversation = structure_to_messages(query,
+                                                     system_prompt if system_prompt not in [None, '', 'auto'] else None,
+                                                     chat_conversation)
+                documents = [merge_dict(dict(text=x.page_content),
+                                        {k: v for k, v in x.metadata.items() if
+                                         v and k in metadata_in_context_set}) for x in docs]
+                query_with_docs = tokenizer.apply_grounded_generation_template(
+                    conversation,
+                    documents=documents,
+                    citation_mode="accurate",  # or "fast"
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                grounded_tokens = len(tokenizer.encode(query_with_docs))
+                if grounded_tokens > max_input_tokens and len(docs) > 0:
+                    if docs_ordering_type in ['best_first']:
+                        docs.pop()
+                    elif docs_ordering_type in ['best_near_prompt', 'reverse_sort']:
+                        docs.pop(0)
+                    elif docs_ordering_type in ['', None, 'reverse_ucurve_sort']:
+                        del docs[len(docs) // 2]
+                    else:
+                        raise ValueError("No such docs_ordering_type=%s" % docs_ordering_type)
+
+                elif grounded_tokens > max_input_tokens and len(chat_conversation) > 0:
+                    chat_conversation = []
+                elif grounded_tokens > max_input_tokens and system_prompt:
+                    system_prompt = ''
+                else:
+                    if grounded_tokens > max_input_tokens:
+                        print("Failed to fit grounded tokens: %s %s" % (grounded_tokens, max_input_tokens))
+                    break
+
+            chain_kwargs = dict(input_documents=[], question=query_with_docs)
         else:
-            # only if use_openai_model = True, unused normally except in testing
-            chain = load_qa_with_sources_chain(llm)
-        chain_kwargs = dict(input_documents=docs, question=query)
+            if use_template:
+                # instruct-like, rather than few-shot prompt_type='plain' as default
+                # but then sources confuse the model with how inserted among rest of text, so avoid
+                prompt = PromptTemplate(
+                    # input_variables=["summaries", "question"],
+                    input_variables=["context", "question"],
+                    template=template,
+                )
+                chain = load_qa_chain(llm, prompt=prompt, verbose=verbose)
+            else:
+                # unused normally except in testing
+                assert use_openai_model or prompt_type in [noop_prompt_type,
+                                                           unknown_prompt_type], "Unexpected to use few-shot template for %s %s" % (
+                    model_name, prompt_type)
+                chain = load_qa_with_sources_chain(llm)
+            chain_kwargs = dict(input_documents=docs, question=query)
         target = wrapped_partial(chain, chain_kwargs)
     elif summarize_action:
         if async_output:
@@ -5315,6 +7751,7 @@ def get_chain(query=None,
             return_intermediate_steps = True
         if langchain_action == LangChainAction.SUMMARIZE_MAP.value:
             prompt = PromptTemplate(input_variables=["text"], template=template)
+            # token_max is per llm call
             chain = load_general_summarization_chain(llm, chain_type="map_reduce",
                                                      map_prompt=prompt, combine_prompt=prompt,
                                                      return_intermediate_steps=return_intermediate_steps,
@@ -5390,16 +7827,11 @@ def get_max_input_tokens(llm=None, tokenizer=None, inference_server=None, model_
         # and vllm uses OpenAI API with same limits
         max_input_tokens = model_max_length - max_new_tokens
     elif isinstance(tokenizer, FakeTokenizer):
-        # don't trust that fake tokenizer (e.g. GGML) will make lots of tokens normally, allow more input
+        # don't trust that fake tokenizer (e.g. GGUF/GGML) will make lots of tokens normally, allow more input
         max_input_tokens = model_max_length - min(256, max_new_tokens)
     else:
-        if 'falcon' in model_name or inference_server.startswith('http'):
-            # allow for more input for falcon, assume won't make as long outputs as default max_new_tokens
-            # Also allow if TGI or Gradio, because we tell it input may be same as output, even if model can't actually handle
-            max_input_tokens = model_max_length - min(256, max_new_tokens)
-        else:
-            # trust that maybe model will make so many tokens, so limit input
-            max_input_tokens = model_max_length - max_new_tokens
+        # trust that maybe model will make so many tokens, so limit input
+        max_input_tokens = model_max_length - max_new_tokens
 
     return max_input_tokens
 
@@ -5428,18 +7860,42 @@ def get_tokenizer(db=None, llm=None, tokenizer=None, inference_server=None, use_
     else:
         # backup method
         if os.getenv('HARD_ASSERTS'):
-            assert db_type in ['faiss', 'weaviate']
+            assert db_type in ['faiss', 'weaviate', 'qdrant']
         # use tiktoken for faiss since embedding called differently
         return FakeTokenizer()
+
+
+def escape_braces(text):
+    if not isinstance(text, str):
+        return text
+    """Escapes braces in the text for safe formatting."""
+    return text.replace("{", "{{").replace("}", "}}")
 
 
 def get_template(query, iinput,
                  pre_prompt_query, prompt_query,
                  pre_prompt_summary, prompt_summary,
                  langchain_action,
+                 query_action,
+                 summarize_action,
                  got_any_docs,
                  auto_reduce_chunks,
-                 add_search_to_context):
+                 add_search_to_context,
+                 system_prompt,
+                 doc_json_mode,
+                 prompter=None):
+    # Escape braces in the inputs that will be used in the format strings
+    query_esc = escape_braces(query)
+    iinput = escape_braces(iinput)
+    prompt_summary = escape_braces(prompt_summary)
+    prompt_query = escape_braces(prompt_query)
+    pre_prompt_query = escape_braces(pre_prompt_query)
+    pre_prompt_summary = escape_braces(pre_prompt_summary)
+
+    triple_quotes = """
+\"\"\"
+"""
+
     if got_any_docs and add_search_to_context:
         # modify prompts, assumes patterns like in predefined prompts.  If user customizes, then they'd need to account for that.
         prompt_query = prompt_query.replace('information in the document sources',
@@ -5455,37 +7911,55 @@ def get_template(query, iinput,
         prompt_summary = prompt_summary.replace('information in the document sources',
                                                 'information in the web search sources (and their source dates and website source)')
 
+    if doc_json_mode:
+        triple_quotes = '\n\n'
+        question_fstring = """{{"question": "{question}".  Respond absolutely only in valid JSON.}}"""
+        if got_any_docs:
+            if query_action:
+                system_prompt += '\n' + prompt_query
+            if summarize_action:
+                system_prompt += '\n' + prompt_summary
+        prompt_query = pre_prompt_query = prompt_summary = pre_prompt_summary = ''
+
+    else:
+        question_fstring = """{question}"""
+
     if langchain_action == LangChainAction.QUERY.value:
         if iinput:
             query = "%s\n%s" % (query, iinput)
         if not got_any_docs:
-            template_if_no_docs = template = """{context}{question}"""
+            template_if_no_docs = template = """{context}%s""" % question_fstring
         else:
-            template = """%s
-\"\"\"
-{context}
-\"\"\"
-%s{question}""" % (pre_prompt_query, prompt_query)
-            template_if_no_docs = """{context}{question}"""
+            fstring = "{context}"
+            if prompter and prompter.prompt_type == 'docsgpt':
+                sys_context = "\nSystem Instructions: %s" % system_prompt if system_prompt else "\n"
+                template = """%s%s%s%s%s%s""" % (
+                    question_fstring, "\n### Context\n", fstring, sys_context, '\n', '')
+                sys_context_no_docs = '\n### Context%s' % sys_context if system_prompt else ''
+                # {context} will be empty string, so ok that no new line surrounding it
+                template_if_no_docs = """%s%s%s%s%s""" % (question_fstring, sys_context_no_docs, '', fstring, '')
+            else:
+                template = """%s%s%s%s%s\n%s""" % (
+                    pre_prompt_query, triple_quotes, fstring, triple_quotes, prompt_query, question_fstring)
+                if doc_json_mode:
+                    template_if_no_docs = """{context}{{"question": {question}}}"""
+                else:
+                    template_if_no_docs = """{context}{question}"""
     elif langchain_action in [LangChainAction.SUMMARIZE_ALL.value, LangChainAction.SUMMARIZE_MAP.value,
                               LangChainAction.EXTRACT.value]:
-        none = ['', '\n', None]
-
         # modify prompt_summary if user passes query or iinput
         if query not in none and iinput not in none:
-            prompt_summary = "Focusing on %s, %s, %s" % (query, iinput, prompt_summary)
+            prompt_summary = "Focusing on %s, %s, %s" % (query_esc, iinput, prompt_summary)
         elif query not in none:
-            prompt_summary = "Focusing on %s, %s" % (query, prompt_summary)
+            prompt_summary = "Focusing on %s, %s" % (query_esc, prompt_summary)
         # don't auto reduce
         auto_reduce_chunks = False
         if langchain_action in [LangChainAction.SUMMARIZE_MAP.value, LangChainAction.EXTRACT.value]:
             fstring = '{text}'
         else:
             fstring = '{input_documents}'
-        template = """%s:
-\"\"\"
-%s
-\"\"\"\n%s""" % (pre_prompt_summary, fstring, prompt_summary)
+        # triple_quotes includes \n before """ and after """
+        template = """%s%s%s%s%s\n""" % (pre_prompt_summary, triple_quotes, fstring, triple_quotes, prompt_summary)
         template_if_no_docs = "Exactly only say: There are no documents to summarize/extract from."
     elif langchain_action in [LangChainAction.SUMMARIZE_REFINE]:
         template = ''  # unused
@@ -5496,9 +7970,46 @@ def get_template(query, iinput,
     return template, template_if_no_docs, auto_reduce_chunks, query
 
 
-def get_sources_answer(query, docs, answer, scores, show_rank,
-                       answer_with_sources, append_sources_to_answer,
+def get_hyde_acc(answer, llm_answers, hyde_show_intermediate_in_accordion):
+    if not isinstance(answer, str):
+        return None
+    pre_answer = ''
+    count = 0
+    all_count = len(llm_answers)
+    if llm_answers and hyde_show_intermediate_in_accordion:
+        for title, content in llm_answers.items():
+            if title == 'response_raw':
+                count += 1
+                continue
+            if count + 1 == all_count:
+                # skip one just generating or just generated.  Either not ready yet or final answer not in accordion
+                count += 1
+                continue
+            # improve title for UI
+            if 'llm_answers_hyde_level_0' == title:
+                title = hyde_titles(0)
+            elif 'llm_answers_hyde_level_1' == title:
+                title = hyde_titles(1)
+            elif 'llm_answers_hyde_level_2' == title:
+                title = hyde_titles(2)
+            elif 'llm_answers_hyde_level_3' == title:
+                title = hyde_titles(3)
+            elif 'llm_answers_hyde_level_4' == title:
+                title = hyde_titles(4)
+            pre_answer += get_accordion_named(content, title, font_size=3)
+            count += 1
+
+    return pre_answer
+
+
+def get_sources_answer(query, docs, answer,
+                       llm_answers,
+                       scores, show_rank,
+                       answer_with_sources,
+                       append_sources_to_answer,
+                       append_sources_to_chat,
                        show_accordions=True,
+                       hyde_show_intermediate_in_accordion=True,
                        show_link_in_sources=True,
                        top_k_docs_max_show=10,
                        verbose=False,
@@ -5508,21 +8019,29 @@ def get_sources_answer(query, docs, answer, scores, show_rank,
         print("query: %s" % query, flush=True)
         print("answer: %s" % answer, flush=True)
 
-    if len(docs) == 0:
-        extra = ''
-        ret = answer + extra
-        return ret, extra
+    pre_answer = get_hyde_acc(answer, llm_answers, hyde_show_intermediate_in_accordion)
+    if pre_answer:
+        pre_answer = pre_answer + '<br>'
+        answer_with_acc = pre_answer + answer
+    else:
+        # e.g. extract goes here, list not str
+        answer_with_acc = answer
 
+    if len(docs) == 0:
+        sources = []
+        return answer_with_acc, sources, answer, ''
+
+    sources = [dict(score=score, content=get_doc(x), source=get_source(x), orig_index=x.metadata.get('orig_index', 0))
+               for score, x in zip(scores, docs)][
+              :top_k_docs_max_show]
     if answer_with_sources == -1:
-        extra = [dict(score=score, content=get_doc(x), source=get_source(x), orig_index=x.metadata.get('orig_index', 0))
-                 for score, x in zip(scores, docs)][
-                :top_k_docs_max_show]
+        sources_str = [str(x) for x in sources]
+        sources_str = '\n'.join(sources_str)
         if append_sources_to_answer:
-            extra_str = [str(x) for x in extra]
-            ret = answer + '\n\n' + '\n'.join(extra_str)
+            ret = answer_with_acc + '\n\n' + sources_str
         else:
-            ret = answer
-        return ret, extra
+            ret = answer_with_acc
+        return ret, sources, answer, sources_str
 
     # link
     answer_sources = [(max(0.0, 1.5 - score) / 1.5,
@@ -5531,16 +8050,18 @@ def get_sources_answer(query, docs, answer, scores, show_rank,
                       zip(scores, docs)]
     if not show_accordions:
         answer_sources_dict = defaultdict(list)
-        [answer_sources_dict[url].append(score) for score, url in answer_sources]
+        [answer_sources_dict[url].append((score, accordion)) for score, url, accordion in answer_sources]
         answers_dict = {}
-        for url, scores_url in answer_sources_dict.items():
-            answers_dict[url] = np.max(scores_url)
-        answer_sources = [(score, url) for url, score in answers_dict.items()]
+        for url, key in answer_sources_dict.items():
+            scores_url = [x[0] for x in key]
+            accordions = [x[1] for x in key]
+            answers_dict[url] = (np.max(scores_url), accordions[0] if accordions else '')
+        answer_sources = [(score, url, accordion) for url, (score, accordion) in answers_dict.items()]
     answer_sources.sort(key=lambda x: x[0], reverse=True)
     if show_rank:
         # answer_sources = ['%d | %s' % (1 + rank, url) for rank, (score, url) in enumerate(answer_sources)]
         # sorted_sources_urls = "Sources [Rank | Link]:<br>" + "<br>".join(answer_sources)
-        answer_sources = ['%s' % url for rank, (score, url) in enumerate(answer_sources)]
+        answer_sources = ['%s' % url for rank, (score, url, _) in enumerate(answer_sources)]
         answer_sources = answer_sources[:top_k_docs_max_show]
         sorted_sources_urls = "Ranked Sources:<br>" + "<br>".join(answer_sources)
     else:
@@ -5554,10 +8075,10 @@ def get_sources_answer(query, docs, answer, scores, show_rank,
         else:
             if show_link_in_sources:
                 answer_sources = ['<font size="%s"><li>%.2g | %s</li></font>' % (font_size, score, url)
-                                  for score, url in answer_sources]
+                                  for score, url, accordion in answer_sources]
             else:
                 answer_sources = ['<font size="%s"><li>%.2g</li></font>' % (font_size, score)
-                                  for score, url in answer_sources]
+                                  for score, url, accordion in answer_sources]
         answer_sources = answer_sources[:top_k_docs_max_show]
         if show_accordions:
             sorted_sources_urls = f"<font size=\"{font_size}\">{source_prefix}<ul></font>" + "".join(answer_sources)
@@ -5580,16 +8101,19 @@ def get_sources_answer(query, docs, answer, scores, show_rank,
 
     if isinstance(answer, str) and not answer.endswith('\n'):
         answer += '\n'
+    if isinstance(answer_with_acc, str) and not answer_with_acc.endswith('\n'):
+        answer_with_acc += '\n'
 
+    answer_no_refs = answer
     if answer_with_sources:
-        extra = '\n' + sorted_sources_urls
+        sources_str = '\n' + sorted_sources_urls
     else:
-        extra = ''
-    if isinstance(answer, str) and append_sources_to_answer:
-        ret = answer + extra
+        sources_str = ''
+    if isinstance(answer_with_acc, str) and append_sources_to_answer:
+        ret = answer_with_acc + sources_str
     else:
-        ret = answer
-    return ret, extra
+        ret = answer_with_acc
+    return ret, sources, answer_no_refs, sources_str
 
 
 def get_any_db(db1s, langchain_mode, langchain_mode_paths, langchain_mode_types,
@@ -5652,25 +8176,8 @@ def get_sources(db1s, selection_docs_state1, requests_state1, langchain_mode,
                 get_userid_auth=None,
                 n_jobs=-1,
                 ):
-    for k in db1s:
-        set_dbid(db1s[k])
-    langchain_mode_paths = selection_docs_state1['langchain_mode_paths']
-    langchain_mode_types = selection_docs_state1['langchain_mode_types']
-    set_userid(db1s, requests_state1, get_userid_auth)
-    db = get_any_db(db1s, langchain_mode, langchain_mode_paths, langchain_mode_types,
-                    dbs=dbs,
-                    load_db_if_exists=load_db_if_exists,
-                    db_type=db_type,
-                    use_openai_embedding=use_openai_embedding,
-                    hf_embedding_model=hf_embedding_model,
-                    migrate_embedding_model=migrate_embedding_model,
-                    auto_migrate_db=auto_migrate_db,
-                    for_sources_list=True,
-                    verbose=verbose,
-                    n_jobs=n_jobs,
-                    )
-
-    if langchain_mode in ['LLM'] or db is None:
+    db = None
+    if langchain_mode in ['LLM', 'Disabled']:
         source_files_added = "NA"
         source_list = []
         num_chunks = 0
@@ -5681,43 +8188,73 @@ def get_sources(db1s, selection_docs_state1, requests_state1, langchain_mode,
         source_list = []
         num_chunks = 0
         num_sources_str = str(0)
-    elif db is not None:
-        metadatas = get_metadatas(db, full_required=False)
-        source_list = sorted(set([x['source'] for x in metadatas]))
-        source_files_added = '\n'.join(source_list)
-        num_chunks = len(metadatas)
-        num_sources_str = ">=%d" % len(source_list)
-        if is_chroma_db(db):
-            num_chunks_real = db._collection.count()
-            if num_chunks_real == num_chunks:
-                num_sources_str = "=%d" % len(source_list)
-            else:
-                num_chunks = num_chunks_real
     else:
-        source_list = []
-        source_files_added = "None"
-        num_chunks = 0
-        num_sources_str = str(0)
-    sources_dir = "sources_dir"
-    sources_dir = makedirs(sources_dir, exist_ok=True, tmp_ok=True, use_base=True)
-    sources_file = os.path.join(sources_dir, 'sources_%s_%s' % (langchain_mode, str(uuid.uuid4())))
-    with open(sources_file, "wt") as f:
-        f.write(source_files_added)
+        for k in db1s:
+            set_dbid(db1s[k])
+        langchain_mode_paths = selection_docs_state1['langchain_mode_paths']
+        langchain_mode_types = selection_docs_state1['langchain_mode_types']
+        set_userid(db1s, requests_state1, get_userid_auth)
+        db = get_any_db(db1s, langchain_mode, langchain_mode_paths, langchain_mode_types,
+                        dbs=dbs,
+                        load_db_if_exists=load_db_if_exists,
+                        db_type=db_type,
+                        use_openai_embedding=use_openai_embedding,
+                        hf_embedding_model=hf_embedding_model,
+                        migrate_embedding_model=migrate_embedding_model,
+                        auto_migrate_db=auto_migrate_db,
+                        for_sources_list=True,
+                        verbose=verbose,
+                        n_jobs=n_jobs,
+                        )
+        if db is not None:
+            metadatas = get_metadatas(db, full_required=False)
+            metadatas_sources = [x['source'] for x in metadatas if not x.get('exception', '')]
+            exception_metadatas_sources = [x['source'] for x in metadatas if x.get('exception', '')]
+            source_list = sorted(set(metadatas_sources))
+            source_files_added = '\n'.join(source_list)
+            num_chunks = len(metadatas_sources)
+            num_sources_str = ">=%d" % len(source_list)
+            if is_chroma_db(db):
+                num_chunks_real = db._collection.count()  # includes exceptions
+                num_chunks_real -= len(exception_metadatas_sources)  # exclude exceptions
+                if num_chunks_real == num_chunks:
+                    num_sources_str = "=%d" % len(source_list)
+                else:
+                    num_chunks = num_chunks_real
+        else:
+            source_list = []
+            source_files_added = "None"
+            num_chunks = 0
+            num_sources_str = str(0)
+    sources_file = make_sources_file(langchain_mode, source_files_added)
     source_list = docs_state0 + source_list
     if DocumentChoice.ALL.value in source_list:
         source_list.remove(DocumentChoice.ALL.value)
     return sources_file, source_list, num_chunks, num_sources_str, db
 
 
+def make_sources_file(langchain_mode, source_files_added):
+    sources_dir = "sources_dir"
+    sources_dir = makedirs(sources_dir, exist_ok=True, tmp_ok=True, use_base=True)
+    sources_file = os.path.join(sources_dir, 'sources_%s_%s' % (langchain_mode, str(uuid.uuid4())))
+    with open(sources_file, "wt", encoding="utf-8") as f:
+        f.write(source_files_added)
+    return sources_file
+
+
 def update_user_db(file, db1s, selection_docs_state1, requests_state1,
                    langchain_mode=None,
                    get_userid_auth=None,
                    **kwargs):
-    kwargs.update(selection_docs_state1)
-    set_userid(db1s, requests_state1, get_userid_auth)
-
     if file is None:
         raise RuntimeError("Don't use change, use input")
+
+    # can't do below, langchain_mode can change, e.g. LLM -> MyData and UI will reflect
+    # if langchain_mode in ['LLM', 'Disabled']:
+    #    return None, langchain_mode, "", "", None, None
+
+    kwargs.update(selection_docs_state1)
+    set_userid(db1s, requests_state1, get_userid_auth)
 
     try:
         return _update_user_db(file, db1s=db1s,
@@ -5740,9 +8277,9 @@ def update_user_db(file, db1s, selection_docs_state1, requests_state1,
         </html>
         """.format(ex_str)
         doc_exception_text = str(e)
-        return None, langchain_mode, source_files_added, doc_exception_text, None
+        return None, langchain_mode, source_files_added, doc_exception_text, None, None
     finally:
-        clear_torch_cache()
+        clear_torch_cache(allow_skip=True)
 
 
 def get_lock_file(db1, langchain_mode):
@@ -5768,6 +8305,8 @@ def _update_user_db(file,
                     use_unstructured=True,
                     use_playwright=False,
                     use_selenium=False,
+                    use_scrapeplaywright=False,
+                    use_scrapehttp=False,
 
                     # pdfs
                     use_pymupdf='auto',
@@ -5782,13 +8321,20 @@ def _update_user_db(file,
                     enable_doctr=False,
                     enable_pix2struct=False,
                     enable_captions=True,
+                    enable_llava=True,
+                    enable_transcriptions=True,
                     captions_model=None,
                     caption_loader=None,
                     doctr_loader=None,
                     pix2struct_loader=None,
+                    llava_model=None,
+                    llava_prompt=None,
+                    asr_model=None,
+                    asr_loader=None,
 
                     # json
                     jq_schema='.[]',
+                    extract_frames=10,
 
                     dbs=None, db_type=None,
                     langchain_modes=None,
@@ -5801,6 +8347,13 @@ def _update_user_db(file,
                     verbose=None,
                     n_jobs=-1,
                     is_url=None, is_txt=None,
+                    is_public=False,
+                    from_ui=False,
+
+                    gradio_upload_to_chatbot_num_max=None,
+
+                    allow_upload_to_my_data=None,
+                    allow_upload_to_user_data=None,
                     ):
     assert db1s is not None
     assert chunk is not None
@@ -5810,19 +8363,41 @@ def _update_user_db(file,
     assert migrate_embedding_model is not None
     assert auto_migrate_db is not None
     assert caption_loader is not None
+    assert asr_loader is not None
     assert doctr_loader is not None
     assert enable_captions is not None
+    assert enable_transcriptions is not None
     assert captions_model is not None
+    assert asr_model is not None
     assert enable_ocr is not None
     assert enable_doctr is not None
     assert enable_pdf_ocr is not None
     assert enable_pdf_doctr is not None
     assert enable_pix2struct is not None
+    assert enable_llava is not None
     assert verbose is not None
+    assert gradio_upload_to_chatbot_num_max is not None
+    assert allow_upload_to_my_data is not None
+    assert allow_upload_to_user_data is not None
 
     if dbs is None:
         dbs = {}
     assert isinstance(dbs, dict), "Wrong type for dbs: %s" % str(type(dbs))
+
+    if langchain_mode is not None:
+        in_scratch_db = langchain_mode in db1s
+        in_user_db = dbs is not None and langchain_mode in dbs
+        if in_scratch_db and not allow_upload_to_my_data:
+            raise ValueError("Not allowed to upload to scratch/personal space")
+        elif in_user_db and not allow_upload_to_user_data:
+            raise ValueError("Not allowed to upload to shared space")
+        elif langchain_mode_types and langchain_mode in langchain_mode_types and langchain_mode_types[
+            langchain_mode] in [LangChainTypes.SHARED.value] and not allow_upload_to_user_data:
+            raise ValueError("Not allowed to upload to shared space")
+        elif langchain_mode_types and langchain_mode in langchain_mode_types and langchain_mode_types[
+            langchain_mode] in [LangChainTypes.PERSONAL.value] and not allow_upload_to_my_data:
+            raise ValueError("Not allowed to upload to scratch/personal space")
+
     # handle case of list of temp buffer
     if isinstance(file, str) and file.strip().startswith('['):
         try:
@@ -5837,8 +8412,14 @@ def _update_user_db(file,
     if not isinstance(file, (list, tuple, typing.Generator)) and isinstance(file, str):
         file = [file]
 
+    if is_public:
+        if len(file) > max_docs_public and from_ui or \
+                len(file) > max_docs_public_api and not from_ui:
+            raise ValueError("Public instance only allows up to"
+                             " %d (%d from API) documents updated at a time." % (max_docs_public, max_docs_public_api))
+
     if langchain_mode == LangChainMode.DISABLED.value:
-        return None, langchain_mode, get_source_files(), "", None
+        return None, langchain_mode, get_source_files(), "", None, {}
 
     if langchain_mode in [LangChainMode.LLM.value]:
         # then switch to MyData, so langchain_mode also becomes way to select where upload goes
@@ -5848,7 +8429,7 @@ def _update_user_db(file,
         elif len(langchain_modes) >= 1:
             langchain_mode = langchain_modes[0]
         else:
-            return None, langchain_mode, get_source_files(), "", None
+            return None, langchain_mode, get_source_files(), "", None, {}
 
     if langchain_mode_paths is None:
         langchain_mode_paths = {}
@@ -5878,7 +8459,7 @@ def _update_user_db(file,
 
     # expect string comparison, if dict then model object with name and get name not dict or model
     hf_embedding_model_str = get_hf_embedding_model_name(hf_embedding_model)
-    if is_txt and hf_embedding_model_str == 'fake':
+    if not is_url and is_txt and hf_embedding_model_str == 'fake':
         # avoid parallel if fake embedding since assume trivial ingestion
         n_jobs = 1
 
@@ -5894,6 +8475,8 @@ def _update_user_db(file,
                            use_unstructured=use_unstructured,
                            use_playwright=use_playwright,
                            use_selenium=use_selenium,
+                           use_scrapeplaywright=use_scrapeplaywright,
+                           use_scrapehttp=use_scrapehttp,
 
                            # pdfs
                            use_pymupdf=use_pymupdf,
@@ -5908,15 +8491,25 @@ def _update_user_db(file,
                            enable_doctr=enable_doctr,
                            enable_pix2struct=enable_pix2struct,
                            enable_captions=enable_captions,
+                           enable_llava=enable_llava,
+                           enable_transcriptions=enable_transcriptions,
                            captions_model=captions_model,
                            caption_loader=caption_loader,
                            doctr_loader=doctr_loader,
                            pix2struct_loader=pix2struct_loader,
+                           llava_model=llava_model,
+                           llava_prompt=llava_prompt,
+                           asr_model=asr_model,
+                           asr_loader=asr_loader,
 
                            # json
                            jq_schema=jq_schema,
+                           extract_frames=extract_frames,
 
                            db_type=db_type,
+
+                           is_public=is_public,
+                           from_ui=from_ui,
                            )
     exceptions = [x for x in sources if x.metadata.get('exception')]
     exceptions_strs = [x.metadata['exception'] for x in exceptions]
@@ -5929,13 +8522,15 @@ def _update_user_db(file,
     db1 = get_db1(db1s, langchain_mode)
 
     lock_file = get_lock_file(db1s[LangChainMode.MY_DATA.value], langchain_mode)  # user-level lock, not db-level lock
-    with filelock.FileLock(lock_file):
+    lock_func = filelock.FileLock if db1[0] and hasattr(db1[0], '_persist_directory') else NullContext
+    with lock_func(lock_file):
         if langchain_mode in db1s:
             if db1[0] is not None:
                 # then add
                 db, num_new_sources, new_sources_metadata = add_to_db(db1[0], sources, db_type=db_type,
                                                                       use_openai_embedding=use_openai_embedding,
-                                                                      hf_embedding_model=hf_embedding_model)
+                                                                      hf_embedding_model=hf_embedding_model,
+                                                                      verbose=verbose)
             else:
                 # in testing expect:
                 # assert len(db1) == length_db1() and db1[1] is None, "Bad MyData db: %s" % db1
@@ -5957,15 +8552,19 @@ def _update_user_db(file,
                             hf_embedding_model=hf_embedding_model,
                             migrate_embedding_model=migrate_embedding_model,
                             auto_migrate_db=auto_migrate_db,
-                            n_jobs=n_jobs)
+                            n_jobs=n_jobs,
+                            verbose=verbose)
             if db is not None:
                 db1[0] = db
             source_files_added = get_source_files(db=db1[0], exceptions=exceptions)
             if len(sources) > 0:
                 sources_last = os.path.basename(sources[-1].metadata.get('source', 'Unknown Source'))
+                all_sources_last_dict = get_all_sources_last_dict(sources, gradio_upload_to_chatbot_num_max)
             else:
                 sources_last = None
-            return None, langchain_mode, source_files_added, '\n'.join(exceptions_strs), sources_last
+                all_sources_last_dict = {}
+            return None, langchain_mode, source_files_added, '\n'.join(
+                exceptions_strs), sources_last, all_sources_last_dict
         else:
             langchain_type = langchain_mode_types.get(langchain_mode, LangChainTypes.EITHER.value)
             persist_directory, langchain_type = get_persist_directory(langchain_mode, db1s=db1s, dbs=dbs,
@@ -5975,7 +8574,8 @@ def _update_user_db(file,
                 # then add
                 db, num_new_sources, new_sources_metadata = add_to_db(dbs[langchain_mode], sources, db_type=db_type,
                                                                       use_openai_embedding=use_openai_embedding,
-                                                                      hf_embedding_model=hf_embedding_model)
+                                                                      hf_embedding_model=hf_embedding_model,
+                                                                      verbose=verbose)
             else:
                 # then create.  Or might just be that dbs is unfilled, then it will fill, then add
                 db = get_db(sources, use_openai_embedding=use_openai_embedding,
@@ -5987,7 +8587,8 @@ def _update_user_db(file,
                             hf_embedding_model=hf_embedding_model,
                             migrate_embedding_model=migrate_embedding_model,
                             auto_migrate_db=auto_migrate_db,
-                            n_jobs=n_jobs)
+                            n_jobs=n_jobs,
+                            verbose=verbose)
             dbs[langchain_mode] = db
             # NOTE we do not return db, because function call always same code path
             # return dbs[langchain_mode]
@@ -5995,9 +8596,26 @@ def _update_user_db(file,
             source_files_added = get_source_files(db=dbs[langchain_mode], exceptions=exceptions)
             if len(sources) > 0:
                 sources_last = os.path.basename(sources[-1].metadata.get('source', 'Unknown Source'))
+                all_sources_last_dict = get_all_sources_last_dict(sources, gradio_upload_to_chatbot_num_max)
             else:
                 sources_last = None
-            return None, langchain_mode, source_files_added, '\n'.join(exceptions_strs), sources_last
+                all_sources_last_dict = {}
+            return None, langchain_mode, source_files_added, '\n'.join(
+                exceptions_strs), sources_last, all_sources_last_dict
+
+
+def get_all_sources_last_dict(sources, gradio_upload_to_chatbot_num_max):
+    valid_sources = [x for x in sources if
+                     x.metadata.get('source', '') and x.page_content and x.metadata.get('chunk_id', -1) == -1]
+    # FIXME: Choose longest output if multiple?
+
+    # only what can be shown in gradio
+    allowed_types = image_types + audio_types
+    valid_sources = [x for x in valid_sources if any(x.metadata['source'].endswith(y) for y in allowed_types)]
+
+    all_sources_last_dict = {x.metadata['source']: x.page_content
+                             for x in valid_sources[:gradio_upload_to_chatbot_num_max]}
+    return all_sources_last_dict
 
 
 def get_source_files_given_langchain_mode(db1s, selection_docs_state1, requests_state1, document_choice1,
@@ -6013,6 +8631,9 @@ def get_source_files_given_langchain_mode(db1s, selection_docs_state1, requests_
                                           get_userid_auth=None,
                                           delete_sources=False,
                                           n_jobs=-1):
+    if langchain_mode in ['LLM', 'Disabled']:
+        return "Sources: N/A"
+
     langchain_mode_paths = selection_docs_state1['langchain_mode_paths']
     langchain_mode_types = selection_docs_state1['langchain_mode_types']
     set_userid(db1s, requests_state1, get_userid_auth)
@@ -6031,7 +8652,7 @@ def get_source_files_given_langchain_mode(db1s, selection_docs_state1, requests_
     if delete_sources:
         del_from_db(db, document_choice1, db_type=db_type)
 
-    if langchain_mode in ['LLM'] or db is None:
+    if db is None:
         return "Sources: N/A"
     return get_source_files(db=db, exceptions=None)
 
@@ -6058,16 +8679,26 @@ def get_source_files(db=None, exceptions=None, metadatas=None):
         adding_new = True
 
     # below automatically de-dups
-    small_dict = {get_url(x['source'], from_str=True, short_name=True): get_short_name(x.get('head')) for x in
-                  metadatas if x.get('page', 0) == 0}
+    # non-exception cases only
+    small_dict = dict()
+    for page_0 in [1, 0]:
+        small_dict.update({get_url(x['source'], from_str=True, short_name=True): get_short_name(x.get('head')) for x in
+                           metadatas if x.get('page', 0) in [page_0] and not x.get('exception', '')})
     # if small_dict is empty dict, that's ok
     df = pd.DataFrame(small_dict.items(), columns=['source', 'head'])
     df.index = df.index + 1
     df.index.name = 'index'
     source_files_added = tabulate.tabulate(df, headers='keys', tablefmt='unsafehtml')
 
-    if exceptions:
+    no_exception_metadatas = [x for x in metadatas if not x.get('exception')]
+
+    if not exceptions:
+        # auto-get exceptions
+        exception_metadatas = [x for x in metadatas if x.get('exception')]
+    else:
         exception_metadatas = [x.metadata for x in exceptions]
+
+    if exception_metadatas:
         small_dict = {get_url(x['source'], from_str=True, short_name=True): get_short_name(x.get('exception')) for x in
                       exception_metadatas}
         # if small_dict is empty dict, that's ok
@@ -6078,7 +8709,7 @@ def get_source_files(db=None, exceptions=None, metadatas=None):
     else:
         exceptions_html = ''
 
-    if metadatas and exceptions:
+    if no_exception_metadatas and exception_metadatas:
         source_files_added = """\
         <html>
           <body>
@@ -6092,7 +8723,7 @@ def get_source_files(db=None, exceptions=None, metadatas=None):
           </body>
         </html>
         """.format(source_label, source_files_added, exceptions_html)
-    elif metadatas:
+    elif no_exception_metadatas:
         source_files_added = """\
         <html>
           <body>
@@ -6136,6 +8767,8 @@ def update_and_get_source_files_given_langchain_mode(db1s,
                                                      use_unstructured=True,
                                                      use_playwright=False,
                                                      use_selenium=False,
+                                                     use_scrapeplaywright=False,
+                                                     use_scrapehttp=False,
 
                                                      # pdfs
                                                      use_pymupdf='auto',
@@ -6150,13 +8783,20 @@ def update_and_get_source_files_given_langchain_mode(db1s,
                                                      enable_doctr=False,
                                                      enable_pix2struct=False,
                                                      enable_captions=True,
+                                                     enable_llava=True,
+                                                     enable_transcriptions=True,
                                                      captions_model=None,
                                                      caption_loader=None,
                                                      doctr_loader=None,
                                                      pix2struct_loader=None,
+                                                     llava_model=None,
+                                                     llava_prompt=None,
+                                                     asr_model=None,
+                                                     asr_loader=None,
 
                                                      # json
                                                      jq_schema='.[]',
+                                                     extract_frames=10,
 
                                                      dbs=None, first_para=None,
                                                      hf_embedding_model=None,
@@ -6166,6 +8806,9 @@ def update_and_get_source_files_given_langchain_mode(db1s,
                                                      text_limit=None,
                                                      db_type=None, load_db_if_exists=None,
                                                      n_jobs=None, verbose=None, get_userid_auth=None):
+    if langchain_mode in ['LLM', 'Disabled']:
+        return get_source_files(db=None, exceptions=None, metadatas=None)
+
     set_userid(db1s, requests_state, get_userid_auth)
     assert hf_embedding_model is not None
     assert migrate_embedding_model is not None
@@ -6207,6 +8850,8 @@ def update_and_get_source_files_given_langchain_mode(db1s,
                                                         use_unstructured=use_unstructured,
                                                         use_playwright=use_playwright,
                                                         use_selenium=use_selenium,
+                                                        use_scrapeplaywright=use_scrapeplaywright,
+                                                        use_scrapehttp=use_scrapehttp,
 
                                                         # pdfs
                                                         use_pymupdf=use_pymupdf,
@@ -6221,13 +8866,20 @@ def update_and_get_source_files_given_langchain_mode(db1s,
                                                         enable_doctr=enable_doctr,
                                                         enable_pix2struct=enable_pix2struct,
                                                         enable_captions=enable_captions,
+                                                        enable_llava=enable_llava,
+                                                        enable_transcriptions=enable_transcriptions,
                                                         captions_model=captions_model,
                                                         caption_loader=caption_loader,
                                                         doctr_loader=doctr_loader,
                                                         pix2struct_loader=pix2struct_loader,
+                                                        llava_model=llava_model,
+                                                        llava_prompt=llava_prompt,
+                                                        asr_model=asr_model,
+                                                        asr_loader=asr_loader,
 
                                                         # json
                                                         jq_schema=jq_schema,
+                                                        extract_frames=extract_frames,
 
                                                         langchain_mode=langchain_mode,
                                                         langchain_mode_paths=langchain_mode_paths,
@@ -6335,6 +8987,62 @@ def _create_local_weaviate_client():
     except Exception as e:
         print(f"Failed to create Weaviate client: {e}")
         return None
+
+
+def _get_qdrant_options():
+    env_vars = os.environ.keys()
+
+    qdrant_env_vars = [var for var in env_vars if var.startswith("QDRANT_")]
+
+    if len(qdrant_env_vars) == 0:
+        return None
+
+    options = {
+        "url": os.getenv("QDRANT_URL", None),
+        "host": os.getenv("QDRANT_HOST", None),
+        "port": int(os.getenv("QDRANT_PORT", 6333)),
+        "grpc_port": int(os.getenv("QDRANT_GRPC_PORT", 6334)),
+        "prefer_grpc": bool(os.getenv("QDRANT_PREFER_GRPC", False)),
+        "https": bool(os.getenv("QDRANT_HTTPS", None)),
+        "api_key": os.getenv("QDRANT_API_KEY", None),
+        "prefix": os.getenv("QDRANT_PREFIX", None),
+        "timeout": float(os.getenv("QDRANT_TIMEOUT", None)),
+        "path": os.getenv("QDRANT_PATH", None),
+    }
+
+    return options
+
+
+def _get_unique_sources_in_qdrant(db):
+    from langchain_community.vectorstores import Qdrant
+    import grpc
+
+    if not isinstance(db, Qdrant):
+        raise ValueError("db must be an instance of langchain.vectorstores.Qdrant")
+
+    sources = []
+    next_offset = None
+    stop_scrolling = False
+    scroll_size = 1000
+
+    while not stop_scrolling:
+        records, next_offset = db.client.scroll(
+            collection_name=db.collection_name,
+            limit=scroll_size,
+            offset=next_offset,
+            with_payload=True,
+        )
+
+        # Qdrant client supports a REST and GPRC interface. So we need to handle the response differently
+        stop_scrolling = next_offset is None or (
+                isinstance(next_offset, grpc.PointId)
+                and next_offset.num == 0
+                and next_offset.uuid == ""
+        )
+
+        sources.extend(records)
+    unique_sources = {source.payload["metadata"]["source"] for source in sources}
+    return unique_sources
 
 
 if __name__ == '__main__':

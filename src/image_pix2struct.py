@@ -8,7 +8,7 @@ Loader that uses Pix2Struct models to image caption
 from typing import List, Union, Any, Tuple
 
 from langchain.docstore.document import Document
-from langchain.document_loaders import ImageCaptionLoader
+from langchain_community.document_loaders import ImageCaptionLoader
 from utils import get_device, clear_torch_cache
 from PIL import Image
 
@@ -26,7 +26,7 @@ class H2OPix2StructLoader(ImageCaptionLoader):
     def set_context(self):
         if get_device() == 'cuda':
             import torch
-            n_gpus = torch.cuda.device_count() if torch.cuda.is_available else 0
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
             if n_gpus > 0:
                 self.context_class = torch.device
                 self.device = 'cuda'

@@ -54,7 +54,7 @@ results_file = "./benchmarks/perf.json"
 @wrap_test_forked
 def test_perf_benchmarks(backend, base_model, task, bits, ngpus):
     reps = 3
-    bench_dict = locals()
+    bench_dict = locals().copy()
     from datetime import datetime
     import json
     import socket
@@ -138,7 +138,7 @@ def test_perf_benchmarks(backend, base_model, task, bits, ngpus):
 
         # get file for client to upload
         url = 'https://cdn.openai.com/papers/whisper.pdf'
-        test_file1 = os.path.join('/tmp/', 'my_test_pdf.pdf')
+        test_file1 = os.path.join('/tmp/', 'whisper1.pdf')
         download_simple(url, dest=test_file1)
 
         # PURE client code
@@ -154,11 +154,15 @@ def test_perf_benchmarks(backend, base_model, task, bits, ngpus):
             chunk_size = 512
             langchain_mode = 'MyData'
             embed = True
-            loaders = tuple([None, None, None, None])
+            loaders = tuple([None, None, None, None, None])
+            extract_frames = 1
+            llava_prompt = ''
             h2ogpt_key = ''
             res = client.predict(test_file_server,
                                  chunk, chunk_size, langchain_mode, embed,
                                  *loaders,
+                                 extract_frames,
+                                 llava_prompt,
                                  h2ogpt_key,
                                  api_name='/add_file_api')
             assert res[0] is None
@@ -176,6 +180,7 @@ def test_perf_benchmarks(backend, base_model, task, bits, ngpus):
                           max_new_tokens=max_new_tokens,
                           max_time=300,
                           do_sample=False,
+                          seed=1234,
                           prompt_summary='Summarize into single paragraph',
                           system_prompt='',
                           )
